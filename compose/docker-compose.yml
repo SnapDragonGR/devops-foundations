@@ -1,0 +1,173 @@
+services:
+
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - media_net
+    ports:
+      # qBittorrent WebUI — published on Gluetun because qbit shares its netns
+      - "8080:8080"
+    environment:
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      - VPN_PORT_FORWARDING=on
+      - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+      # Allow LAN traffic (other containers/laptop can reach qbit WebUI)
+      - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12
+      - TZ=${TZ}
+      # Auto-update qBittorrent's listening port when Proton rotates it
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'sleep 30 && wget -O- --retry-connrefused --waitretry=15 --tries=15 --post-data "json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+    volumes:
+      - /srv/media/config/gluetun:/gluetun
+    restart: unless-stopped
+    mem_limit: 150m
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "https://www.google.com"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: "service:gluetun"  # KILL-SWITCH: all traffic via gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    volumes:
+      - /srv/media/config/qbittorrent:/config
+      - /srv/media/data:/data        # hardlinks across torrents/ and media/
+    restart: unless-stopped
+    mem_limit: 256m
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    networks:
+      - media_net
+    ports:
+      - "9696:9696"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/prowlarr:/config
+    restart: unless-stopped
+    mem_limit: 256m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    networks:
+      - media_net
+    ports:
+      - "8989:8989"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/sonarr:/config
+      - /srv/media/data:/data
+    restart: unless-stopped
+    mem_limit: 384m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    networks:
+      - media_net
+    ports:
+      - "7878:7878"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/radarr:/config
+      - /srv/media/data:/data
+    restart: unless-stopped
+    mem_limit: 384m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    networks:
+      - media_net
+    ports:
+      - "6767:6767"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/bazarr:/config
+      - /srv/media/data:/data
+    restart: unless-stopped
+    mem_limit: 256m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    networks:
+      - media_net
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+      - TZ=${TZ}
+    restart: unless-stopped
+    mem_limit: 384m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    networks:
+      - media_net
+    ports:
+      - "8096:8096"
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/jellyfin:/config
+      - /srv/media/data/media:/data/media:ro
+    restart: unless-stopped
+    mem_limit: 512m
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+
+networks:
+  media_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.enable_ipv6: "false"
