@@ -1,0 +1,70 @@
+- name: Baseline Server Hardening
+  hosts: debian_server
+  become: true
+
+  tasks:
+    - name: update apt cache and upgrade all packages
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: dist
+    
+    - name: ensure UFW is disabled
+      community.general.ufw:
+        state: disabled
+      ignore_errors: yes
+    
+    - name: firewalld installation
+      ansible.builtin.apt:
+        name: firewalld
+        state: present
+    
+    - name: firewalld check
+      ansible.builtin.service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: allow SSH traffic through firewalld
+      ansible.posix.firewalld:
+        service: ssh 
+        permanent: yes
+        state: enabled
+        immediate: yes
+    
+    - name: allow mc server traffic
+      ansible.posix.firewalld:
+        port: 25565/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+
+    - name: trust tailscale vpn
+      ansible.posix.firewalld:
+        zone: trusted
+        interface: tailscale0
+        permanent: yes
+        state: enabled
+        immediate: yes
+    
+    - name: trust docker subnets
+      ansible.posix.firewalld:
+        zone: trusted
+        source: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - 172.17.0.0/16
+        - 172.18.0.0/16
+
+    - name: drop all other traffic
+      ansible.posix.firewalld:
+        zone: drop 
+        state: enabled
+        permanent: yes
+        immediate: yes
+    
+    - name: restart docker to rebuild iptables
+      ansible.builtin.service:
+        name: docker
+        state: restarted

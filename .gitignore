@@ -1,0 +1,4 @@
+hosts.yaml
+*.log
+.retry
+
