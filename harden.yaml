@@ -68,3 +68,18 @@
       ansible.builtin.service:
         name: docker
         state: restarted
+    
+    - name: remove password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication\s+.*'
+        line: 'PasswordAuthentication no'
+        validate: sshd -t -f %s
+    
+    - name: disable root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PermitRootLogin\s+.*'
+        line: 'PermitRootLogin no'
+        validate: sshd -t -f %s
+
