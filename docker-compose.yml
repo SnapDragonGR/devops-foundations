@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 7G
 
     environment:
       EULA: "TRUE"
@@ -24,7 +24,7 @@ services:
       ONLINE_MODE: "FALSE"
       ENFORCE_SECURE_PROFILE: "FALSE"
 
-      MEMORY: "3G"
+      MEMORY: "6G"
       USE_AIKAR_FLAGS: "true"
 
       # Bandwidth Cap
