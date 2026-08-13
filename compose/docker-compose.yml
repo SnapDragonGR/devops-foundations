@@ -219,6 +219,22 @@ services:
         limits:
           memory: 256M
 
+  fail2ban:
+    image: lscr.io/linuxserver/fail2ban:latest
+    container_name: fail2ban
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+    volumes:
+      - /srv/media/config/fail2ban:/config
+      - /srv/media/config/npm/data/logs:/var/log/npm:ro
+    restart: unless-stopped
+
 networks:
   media_net:
     driver: bridge
