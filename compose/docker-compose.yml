@@ -186,38 +186,43 @@ services:
         limits:
           memory: 2G
 
-  duckdns:
-    image: lscr.io/linuxserver/duckdns:latest
-    container_name: duckdns
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: seerr
+    init: true
+    networks:
+      - media_net
+    environment:
+      - LOG_LEVEL=debug
+      - TZ=${TZ}
+    ports:
+      - "5055:5055"
+    volumes:
+      - /srv/media/config/seerr:/app/config
+    restart: unless-stopped
+
+  swag:
+    image: lscr.io/linuxserver/swag:latest
+    container_name: swag
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - media_net
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
-      - SUBDOMAINS=gleb-movies
-      - TOKEN=${DUCK_TOKEN}
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 64M
-
-  nginx-proxy-manager:
-    image: jc21/nginx-proxy-manager:latest
-    container_name: nginx-proxy-manager
-    networks:
-      - media_net
-    ports:
-      - "80:80"
-      - "81:81"
-      - "443:443"
+      - URL=gleb-razumnyi.com
+      - VALIDATION=dns
+      - SUBDOMAINS=wildcard
+      - DNSPLUGIN=cloudflare
+      - EMAIL=${EMAIL}
     volumes:
-      - /srv/media/config/npm/data:/data
-      - /srv/media/config/npm/letsencrypt:/etc/letsencrypt
+      - /srv/media/config/swag:/config
+    ports:
+      - "443:443"
+      - "80:80"
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256M
 
   fail2ban:
     image: lscr.io/linuxserver/fail2ban:latest
@@ -232,8 +237,37 @@ services:
       - TZ=${TZ}
     volumes:
       - /srv/media/config/fail2ban:/config
-      - /srv/media/config/npm/data/logs:/var/log/npm:ro
+      - /srv/media/config/swag/log/nginx:/var/log/nginx:ro
     restart: unless-stopped
+
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    networks:
+      - media_net
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "8088:80"
+    environment:
+      - TZ=${TZ}
+      - FTLCONF_LOCAL_IPV4=${SERVER_IP}
+    volumes:
+      - /srv/media/config/pihole/etc-pihole:/etc/pihole
+      - /srv/media/config/pihole/etc-dnsmasq.d:/etc/dnsmasq.d
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    networks:
+      - media_net
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+
+
 
 networks:
   media_net:
