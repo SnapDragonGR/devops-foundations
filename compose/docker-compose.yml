@@ -175,6 +175,8 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       - /srv/media/config/jellyfin:/config
       - /srv/media/data/media:/data/media:rw
@@ -185,6 +187,11 @@ services:
       resources:
         limits:
           memory: 2G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
@@ -199,7 +206,29 @@ services:
       - "5055:5055"
     volumes:
       - /srv/media/config/seerr:/app/config
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
     restart: unless-stopped
+
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    networks:
+      - media_net
+    user: "${PUID}:${PGID}"
+    environment:
+      - TZ=${TZ}
+      - CRON_SCHEDULE=0 5 * * *
+      - RECYCLARR_CREATE_CONFIG=true
+    volumes:
+      - /srv/media/config/recyclarr:/config
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
 
   swag:
     image: lscr.io/linuxserver/swag:latest
@@ -212,13 +241,15 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
-      - URL=gleb-razumnyi.com
+      - URL=${DOMAIN}
       - VALIDATION=dns
       - SUBDOMAINS=wildcard
       - DNSPLUGIN=cloudflare
       - EMAIL=${EMAIL}
     volumes:
       - /srv/media/config/swag:/config
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
     ports:
       - "443:443"
       - "80:80"
@@ -238,6 +269,7 @@ services:
     volumes:
       - /srv/media/config/fail2ban:/config
       - /srv/media/config/swag/log/nginx:/var/log/nginx:ro
+      - /var/log/journal:/var/log/journal:ro
     restart: unless-stopped
 
   pihole:
