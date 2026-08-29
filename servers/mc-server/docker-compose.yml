@@ -32,3 +32,18 @@ services:
       VIEW_DISTANCE: "14"
       SIMULATION_DISTANCE: "9"
       NETWORK_COMPRESSION_THRESHOLD: "512"
+  
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:latest
+    container_name: cloudflare-ddns
+    network_mode: host
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_DDNS_TOKEN}
+      - DOMAINS=${DOMAIN}
+      - PROXIED=false 
+      - IP4_PROVIDER=cloudflare.trace
+      - IP6_PROVIDER=none 
+      - UPDATE_CRON=@every 5m
