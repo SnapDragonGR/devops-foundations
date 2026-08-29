@@ -1,0 +1,6 @@
+config/
+data/
+.env
+Thumbs.db
+.tar.gz
+.zip
