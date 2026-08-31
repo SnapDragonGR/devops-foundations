@@ -299,8 +299,24 @@ services:
     command: tunnel --no-autoupdate run
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
-
-
+  
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:latest
+    container_name: audiobookshelf
+    networks:
+      - media_net
+    environment:
+      - TZ=${TZ}
+    user: "${PUID}:${PGID}"
+    ports:
+      - 13378:80
+    volumes:
+      - /srv/media/data/audiobooks:/audiobooks:rw
+      - /srv/media/config/audiobookshelf/config:/config
+      - /srv/media/config/audiobookshelf/metadata:/metadata
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
 
 networks:
   media_net:
