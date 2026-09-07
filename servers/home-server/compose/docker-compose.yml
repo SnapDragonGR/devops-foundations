@@ -254,6 +254,7 @@ services:
     ports:
       - "443:443"
       - "80:80"
+      - "8443:8443"
     restart: unless-stopped
 
   fail2ban:
@@ -267,10 +268,13 @@ services:
       - PUID=${PUID}
       - PGID=${PGID}
       - TZ=${TZ}
+    group_add:
+      - "999"
     volumes:
       - /srv/media/config/fail2ban:/config
       - /srv/media/config/swag/log/nginx:/var/log/nginx:ro
       - /var/log/journal:/var/log/journal:ro
+      - /srv/media/config/jellyfin/log:/config/log/jellyfin:ro
     restart: unless-stopped
 
   pihole:

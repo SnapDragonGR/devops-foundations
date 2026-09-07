@@ -9,8 +9,8 @@ services:
     tty: true
     stdin_open: true
     volumes:
-      - ./minecraft-data:/data
-      - ./mods:/data/mods
+      - /home/gleb/minecraft-fabric/minecraft-data:/data
+      - /home/gleb/minecraft-fabric/mods:/data/mods
 
     deploy:
       resources:
