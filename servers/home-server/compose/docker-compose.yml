@@ -11,7 +11,7 @@ services:
     networks:
       - media_net
     ports:
-      - "8080:8080"
+      - "${SERVER_IP}:8080:8080"
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=wireguard
@@ -64,7 +64,7 @@ services:
     networks:
       - media_net
     ports:
-      - "9696:9696"
+      - "${SERVER_IP}:9696:9696"
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -85,7 +85,7 @@ services:
     networks:
       - media_net
     ports:
-      - "8989:8989"
+      - "${SERVER_IP}:8989:8989"
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -107,7 +107,7 @@ services:
     networks:
       - media_net
     ports:
-      - "7878:7878"
+      - "${SERVER_IP}:7878:7878"
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -129,7 +129,7 @@ services:
     networks:
       - media_net
     ports:
-      - "6767:6767"
+      - "${SERVER_IP}:6767:6767"
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -171,7 +171,7 @@ services:
     networks:
       - media_net
     ports:
-      - "8096:8096"
+      - "${SERVER_IP}:8096:8096"
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -308,7 +308,8 @@ services:
     image: ghcr.io/advplyr/audiobookshelf:latest
     container_name: audiobookshelf
     networks:
-      - media_net
+      media_net:
+        ipv4_address: 172.19.0.50
     environment:
       - TZ=${TZ}
     user: "${PUID}:${PGID}"
