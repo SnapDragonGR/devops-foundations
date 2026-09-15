@@ -230,6 +230,27 @@ services:
       resources:
         limits:
           memory: 128M
+  
+  cleanuparr:
+    image: ghcr.io/cleanuparr/cleanuparr:latest
+    container_name: cleanuparr
+    networks:
+      - media_net
+    ports:
+      - "11011:11011"
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+    volumes:
+      - /srv/media/config/cleanuparr:/config
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   swag:
     image: lscr.io/linuxserver/swag:latest
