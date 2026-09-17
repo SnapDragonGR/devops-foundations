@@ -19,9 +19,8 @@ do
     case $distro in
         1) echo "Arch is a rolling release.";;
         2) echo "CentOS is popular on servers.";;
-        3) echo "Debian is a community distribution.";;
+        3 | 5) echo "Debian and Ubuntu are a related";;
         4) echo "Mint is popular on desktops and laptops.";;
-        5) echo "Ubuntu is popular on both servers and computers.";;
         6) echo "There are many distributions out there.";;
         7) finished=1 ;;
         *) echo "You didn't enter an appropriate choice."
@@ -29,3 +28,4 @@ do
 done
 
 echo "Thank you for using this script."
+
