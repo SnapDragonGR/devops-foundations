@@ -4,6 +4,14 @@ release_file=/etc/os-release
 logfile=/var/log/updater.log
 errorlog=/var/log/updater_errors.log
 
+check_exit_status() {
+    if [ $? -ne 0 ]
+    then
+        echo "An error occurred, please check the $errorlog file."
+        exit 1
+    fi
+}
+
 if [ -f "$release_file" ] && [ -r "$release_file" ]
 then
     if grep -q "Arch" "$release_file"; then
@@ -16,12 +24,8 @@ then
         echo "Unsupported operating system."
         exit 2
     fi
-    if [ $? -ne 0 ]; then
-        echo "Update was not successful."
-        exit 1
-    else
-        echo "Update was successful. Enjoy"
-    fi
+    check_exit_status
+    echo "Update was successful. Enjoy"
 else
     echo "os-release file not found."
     exit 1
