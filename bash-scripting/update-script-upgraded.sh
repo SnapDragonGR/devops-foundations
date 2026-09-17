@@ -13,18 +13,16 @@ run_update() {
     fi
 }
 
-if [ -f "$release_file" ] && [ -r "$release_file" ]
-then
-    if grep -q "Arch" "$release_file"; then
-        run_update sudo pacman -Syu
-    elif grep -q "Ubuntu" "$release_file" || grep -q "Debian" "$release_file"; then
-        run_update sudo apt update && run_update sudo apt dist-upgrade
-    elif grep -q "Fedora" "$release_file" || grep -q "rhel" "$release_file"; then
-        run_update sudo dnf upgrade
-    else
-        echo "Unsupported operating system."
-        exit 2
-    fi
+if [ -f "$release_file" ] && [ -r "$release_file" ]; then
+    . "$release_file"
+    case "$ID" in
+        "arch") run_update sudo pacman -Syu --noconfirm;;
+        "debian" | "ubuntu") run_update sudo apt update -y && run_update sudo apt dist-upgrade -y;;
+        "fedora" | "rhel") run_update sudo dnf upgrade -y;;
+        *)  echo "Unsupported operating system."
+            exit 2
+            ;;
+    esac
 else
     echo "os-release file not found."
     exit 1
