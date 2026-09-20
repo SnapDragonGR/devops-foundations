@@ -18,5 +18,5 @@ current_date=$(date +%Y-%m-%d)
 
 rsync_options="-avb --backup-dir $2/$current_date --delete"
 
-$(which rsync) $rsync_options $1 $2/current >> backup_$current_date.log
+rsync $rsync_options "$1" "$2/current" >> "backup_$current_date.log"
 
