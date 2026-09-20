@@ -1,0 +1,68 @@
+sending incremental file list
+./
+backup_2026-09-20.log
+test-file
+test-file.txt
+deleting backup/2026-09-20/test-file
+deleting backup/2026-09-20/backup_2026-09-20.log
+cannot delete non-empty directory: backup/2026-09-20
+backup/
+backup/current/
+backup/current/argument.sh
+backup/current/backup.sh
+backup/current/backup_2026-09-20.log
+backup/current/c-style-expression.sh
+backup/current/case-statements.sh
+backup/current/check_service.sh
+backup/current/conf-tar.sh
+backup/current/evaluate.sh
+backup/current/exit-code-caution.sh
+backup/current/exit-code-control.sh
+backup/current/exit-code.sh
+backup/current/file-exists.sh
+backup/current/file-inspector.sh
+backup/current/file.txt
+backup/current/find_errors.txt
+backup/current/find_results.txt
+backup/current/for-loop.sh
+backup/current/greeting.sh
+backup/current/if-statement.sh
+backup/current/job_results.log
+backup/current/lines.sh
+backup/current/myscript.sh
+backup/current/old-backup.sh
+backup/current/package_install_failure.log
+backup/current/package_install_results.log
+backup/current/retry-sim.sh
+backup/current/scheduled.sh
+backup/current/service-health-sim.sh
+backup/current/stdinput.sh
+backup/current/tar-logs.sh
+backup/current/test-file
+backup/current/updater.sh
+backup/current/upgraded-bash.sh
+backup/current/while-file.sh
+backup/current/while.sh
+backup/current/backup/
+backup/current/configs/
+backup/current/configs/1.conf
+backup/current/configs/1.conf.bak
+backup/current/configs/2.conf
+backup/current/configs/2.conf.bak
+backup/current/configs/config.conf
+backup/current/configs/config.conf.bak
+backup/current/configs/etc.conf
+backup/current/configs/etc.conf.bak
+backup/current/configs/some-conf.conf
+backup/current/configs/some-conf.conf.bak
+backup/current/configs/test.conf
+backup/current/configs/test.conf.bak
+backup/current/logfiles/
+backup/current/logfiles/alternatives.log
+backup/current/logfiles/alternatives.log.tar.gz
+backup/current/logfiles/dpkg.log
+backup/current/logfiles/dpkg.log.tar.gz
+backup/current/logfiles/logfile.txt
+
+sent 261,309 bytes  received 1,225 bytes  525,068.00 bytes/sec
+total size is 511,067  speedup is 1.95
