@@ -1,0 +1,6 @@
+[Unit]
+Description=Telegram alert: %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/homelab-notify --urgent "%i failed. Look: sudo journalctl -u %i -n 50"

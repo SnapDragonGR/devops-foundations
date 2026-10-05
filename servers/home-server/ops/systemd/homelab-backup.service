@@ -1,0 +1,10 @@
+[Unit]
+Description=Homelab backup into the restic vault
+After=docker.service
+OnFailure=homelab-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/homelab-backup --nightly
+SuccessExitStatus=75

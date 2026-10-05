@@ -1,0 +1,6 @@
+[Unit]
+Description=Monthly restore test of the MCPC backup copy
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mcpc-restore-test

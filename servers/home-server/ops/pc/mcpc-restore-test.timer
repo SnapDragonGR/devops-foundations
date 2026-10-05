@@ -1,0 +1,9 @@
+[Unit]
+Description=Restore test of the MCPC backup copy, once a month
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

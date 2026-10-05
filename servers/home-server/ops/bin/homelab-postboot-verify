@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# homelab-postboot-verify - after the reboot of an update run: check everything again,
+# repair or roll back if needed, and send the final report.
+# Started at boot by systemd, only if /var/lib/homelab-update/pending-verify exists.
+set -euo pipefail
+# shellcheck disable=SC1091
+. /usr/local/bin/homelab-lib.sh
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+if [ ! -s "$PENDING_FLAG" ]; then
+    echo "Nothing to verify: $PENDING_FLAG does not exist."
+    exit 0
+fi
+RUN="$(head -n 1 "$PENDING_FLAG" | tr -dc '0-9-')"
+RUN_DIR="$STATE_DIR/run-$RUN"
+BASE="$RUN_DIR/baseline.json"
+LOG_FILE="$LOG_DIR/$RUN.log"
+mkdir -p -- "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+STAGE="starting"
+on_exit() {
+    local code=$?
+    trap - EXIT
+    if [ "$code" -ne 0 ]; then
+        log "FAILED during: $STAGE (exit code $code)"
+        # Keep the flag as evidence, under another name, so the next boot does not repeat this.
+        if [ -e "$PENDING_FLAG" ]; then
+            mv -f -- "$PENDING_FLAG" "$PENDING_FLAG.failed-$RUN"
+        fi
+        notify --urgent "After-reboot check FAILED during: $STAGE. Log: $LOG_FILE"
+        printf '%s  after-reboot check FAILED during: %s\n' "$(date '+%F %T')" "$STAGE" > "$LAST_RESULT"
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+log "After-reboot check for run $RUN (kernel now: $(uname -r))"
+STAGE="the files of run $RUN are missing"
+[ -s "$BASE" ]
+
+STAGE="waiting for Docker"
+for _ in $(seq 1 60); do
+    if docker info > /dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
+docker info > /dev/null
+
+STAGE="health check after the reboot"
+AFTER="$RUN_DIR/postboot.json"
+healthy=0
+if wait_healthy "$BASE" "$AFTER"; then
+    healthy=1
+fi
+
+if [ "$healthy" -eq 0 ]; then
+    # Known cure for Docker's network being left in a bad state after a restart:
+    # take the media stack down and bring the same services up again.
+    # Only the "compose" project. Never the Minecraft project.
+    STAGE="recreating the media stack"
+    mapfile -t services < <(jq -r --arg p "$MAIN_PROJECT" '.containers[] | select(.project == $p and .status == "running") | .service' "$BASE")
+    log "Not healthy. Recreating the media stack: ${services[*]}"
+    docker compose -f "$MAIN_FILE" down
+    docker compose -f "$MAIN_FILE" up -d --pull never "${services[@]}"
+    STAGE="health check after recreating the media stack"
+    if wait_healthy "$BASE" "$AFTER"; then
+        healthy=1
+    fi
+fi
+
+if [ "$healthy" -eq 0 ]; then
+    STAGE="rolling back"
+    mapfile -t blamed < <(blamed_apps "$BASE" "$AFTER")
+    to_roll=()
+    for app in "${blamed[@]}"; do
+        if cut -f1 "$RUN_DIR/updated.tsv" | grep -qx "$app" && ! grep -qx "$app" "$RUN_DIR/rolled-back.txt"; then
+            to_roll+=("$app")
+        fi
+    done
+    log "Still not healthy. Blamed: ${blamed[*]:-none}. Updated in this run and blamed: ${to_roll[*]:-none}"
+    if [ "${#to_roll[@]}" -gt 0 ]; then
+        /usr/local/bin/homelab-rollback "$RUN" "${to_roll[@]}"
+        STAGE="health check after the rollback"
+        if wait_healthy "$BASE" "$AFTER"; then
+            healthy=1
+        fi
+    fi
+fi
+
+if [ "$healthy" -eq 0 ]; then
+    STAGE="still failing after the reboot: $(regressions "$BASE" "$AFTER" | tr '\n' ' ')"
+    exit 1
+fi
+
+STAGE="summary"
+rm -f -- "$PENDING_FLAG"
+docker image prune -f > /dev/null || true
+if [ -s "$RUN_DIR/rolled-back.txt" ]; then
+    send_summary "$RUN_DIR" "Update finished after the reboot. Everything is healthy, but some apps had to be ROLLED BACK (see below)."
+else
+    send_summary "$RUN_DIR" "Update finished OK after the reboot."
+fi
+exit 0

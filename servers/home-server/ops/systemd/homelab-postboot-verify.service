@@ -1,0 +1,14 @@
+[Unit]
+Description=Homelab update: check everything after the reboot
+ConditionPathExists=/var/lib/homelab-update/pending-verify
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=homelab-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/homelab-postboot-verify
+
+[Install]
+WantedBy=multi-user.target

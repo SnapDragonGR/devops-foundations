@@ -1,0 +1,9 @@
+[Unit]
+Description=Homelab weekly update, Thursday 02:00
+
+[Timer]
+OnCalendar=Thu *-*-* 02:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# homelab-update - the weekly update: snapshot, Debian updates, new container images,
+# health check, rollback if something broke, reboot if needed.
+#
+#   homelab-update                         the full run (what the Thursday timer starts)
+#   homelab-update --dry-run               print what would happen, change nothing
+#   homelab-update --no-reboot             full run, but never reboot
+#   homelab-update --force-reboot          full run, and reboot even if not needed
+#   homelab-update --rollback-drill APP    practice: snapshot, recreate APP, pretend it
+#                                          failed, roll it back. No updates, no reboot.
+set -euo pipefail
+# shellcheck disable=SC1091
+. /usr/local/bin/homelab-lib.sh
+# systemd starts services without a HOME. Docker's tools expect one.
+export HOME="${HOME:-/root}"
+
+DRY_RUN=0
+REBOOT_MODE=auto
+DRILL_APP=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=1
+            ;;
+        --no-reboot)
+            REBOOT_MODE=never
+            ;;
+        --force-reboot)
+            REBOOT_MODE=force
+            ;;
+        --rollback-drill)
+            if [ $# -lt 2 ]; then
+                echo "--rollback-drill needs an app name" >&2
+                exit 2
+            fi
+            shift
+            DRILL_APP="$1"
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+
+# docker_started_at : print a number that changes whenever the Docker service is restarted.
+docker_started_at() {
+    systemctl show docker -p ExecMainStartTimestampMonotonic --value 2> /dev/null || true
+}
+
+# running_services PROJECT : print the services of a project that are running right now.
+running_services() {
+    containers_json | jq -r --arg p "$1" '.[] | select(.project == $p and .status == "running") | .service'
+}
+
+# ================================ dry run ======================================
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "DRY RUN - nothing is changed. This is what a real run would do, in order:"
+    echo
+    echo " 1. Preflight: Docker must answer, 10 GB must be free on / and on $MEDIA_MOUNT,"
+    echo "    no container may be unhealthy, no earlier run may be waiting for its check."
+    echo "      free on /: $(df --output=avail -BG / | tail -n 1 | tr -dc '0-9') GB,  free on $MEDIA_MOUNT: $(df --output=avail -BG "$MEDIA_MOUNT" | tail -n 1 | tr -dc '0-9') GB"
+    echo " 2. Health check = baseline (homelab-smoke-test)."
+    echo " 3. Telegram: update started."
+    echo " 4. Snapshot. These apps would be stopped, backed up with tag pre-update, started again:"
+    for app in $DB_APPS; do
+        if running_services "$MAIN_PROJECT" | grep -qx "$app"; then
+            echo "      $app"
+        fi
+    done
+    echo "    Then 5% of the vault is re-read as a check."
+    echo " 5. The current image of every running service is kept as homelab-rollback/<service>:<run>."
+    echo " 6. Debian updates: apt-get update, then apt-get upgrade (keeps your config files,"
+    echo "    installs new kernels, never removes a package)."
+    echo "      waiting now, by the last list refresh: $(apt-get -s --with-new-pkgs upgrade 2> /dev/null | grep -c '^Inst ' || true) packages"
+    echo " 7. Reboot decision:"
+    echo "      running kernel:   $(uname -r)"
+    echo "      newest installed: $(newest_kernel)"
+    echo "      /run/reboot-required: $(if [ -e /run/reboot-required ]; then echo present; else echo absent; fi)"
+    if reboot_needed; then
+        if nvidia_ready; then
+            echo "      -> reboot NEEDED and ALLOWED (NVIDIA driver is built for the newest kernel)"
+        else
+            echo "      -> reboot NEEDED but NOT allowed (NVIDIA driver not built for the newest kernel)"
+        fi
+    else
+        echo "      -> no reboot needed"
+    fi
+    echo " 8. New images would be pulled for these running services, and only services"
+    echo "    whose image changed would be recreated:"
+    for project in "$MAIN_PROJECT" "$SIDE_PROJECT"; do
+        echo "      project $project ($(compose_file "$project")):"
+        running_services "$project" | sed 's/^/        /'
+    done
+    echo "    Quarantined images (skipped): $(jq -r 'to_entries | map(.key) | join(" ")' "$QUARANTINE" 2> /dev/null || true)"
+    echo " 9. Health check again, retried for up to 10 minutes, compared with the baseline."
+    echo "10. If a check that passed before now fails: roll back the updated apps it points at"
+    echo "    (homelab-rollback), check again. Still failing: urgent Telegram, stop, no reboot."
+    echo "11. If a reboot is needed and allowed: write $PENDING_FLAG,"
+    echo "    Telegram, reboot. After the boot homelab-postboot-verify checks and reports."
+    echo "12. Otherwise: send the summary now."
+    exit 0
+fi
+
+# ================================ real run =====================================
+RUN="$(date +%Y%m%d-%H%M%S)"
+RUN_DIR="$STATE_DIR/run-$RUN"
+LOG_FILE="$LOG_DIR/$RUN.log"
+mkdir -p -- "$RUN_DIR" "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+STAGE="starting"
+APPS_STOPPED=""
+REBOOTING=0
+
+# start_stopped_apps : start again whatever was stopped for the snapshot.
+start_stopped_apps() {
+    local apps
+    if [ -n "$APPS_STOPPED" ]; then
+        read -r -a apps <<< "$APPS_STOPPED"
+        APPS_STOPPED=""
+        docker compose -f "$MAIN_FILE" start "${apps[@]}" ||
+            log "ERROR: could not start again: ${apps[*]}"
+    fi
+}
+
+on_exit() {
+    local code=$?
+    trap - EXIT
+    start_stopped_apps
+    if [ "$code" -ne 0 ] && [ "$REBOOTING" -eq 0 ]; then
+        log "FAILED during: $STAGE (exit code $code)"
+        notify --urgent "Update STOPPED during: $STAGE. Log: $LOG_FILE"
+        printf '%s  FAILED during: %s\n' "$(date '+%F %T')" "$STAGE" > "$LAST_RESULT"
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+exec 8> /run/homelab-update.lock
+if ! flock -n 8; then
+    STAGE="another update is already running"
+    exit 1
+fi
+
+date +%s > "$RUN_DIR/start-epoch"
+uname -r > "$RUN_DIR/kernel-before"
+: > "$RUN_DIR/updated.tsv"
+: > "$RUN_DIR/rolled-back.txt"
+echo 0 > "$RUN_DIR/apt-count"
+if [ ! -s "$QUARANTINE" ]; then
+    echo '{}' > "$QUARANTINE"
+fi
+# Keep logs and the notes of old runs for 12 weeks.
+find "$LOG_DIR" -name '*.log' -mtime +84 -delete
+find "$STATE_DIR" -maxdepth 1 -type d -name 'run-*' -mtime +84 -exec rm -rf -- {} +
+
+log "Run $RUN started (reboot mode: $REBOOT_MODE${DRILL_APP:+, rollback drill for $DRILL_APP})"
+
+# ---- 1. Preflight -------------------------------------------------------------
+STAGE="preflight: an earlier run is still waiting for its after-boot check ($PENDING_FLAG exists)"
+[ ! -e "$PENDING_FLAG" ]
+STAGE="preflight: Docker does not answer"
+docker info > /dev/null
+STAGE="preflight: less than 10 GB free on / or on $MEDIA_MOUNT"
+[ "$(df --output=avail -BG / | tail -n 1 | tr -dc '0-9')" -ge 10 ]
+mountpoint -q "$MEDIA_MOUNT"
+[ "$(df --output=avail -BG "$MEDIA_MOUNT" | tail -n 1 | tr -dc '0-9')" -ge 10 ]
+unhealthy="$(containers_json | jq -r '.[] | select(.status == "restarting" or .health == "unhealthy") | .name' | tr '\n' ' ')"
+STAGE="preflight: already unhealthy before the update: $unhealthy"
+[ -z "$unhealthy" ]
+
+# ---- 2. Baseline --------------------------------------------------------------
+STAGE="health check before the update"
+BASE="$RUN_DIR/baseline.json"
+/usr/local/bin/homelab-smoke-test --json "$BASE" > "$RUN_DIR/baseline.txt" || true
+jq -e '.checks | length > 0' "$BASE" > /dev/null
+log "Baseline: $(grep -c '^OK' "$RUN_DIR/baseline.txt" || true) checks OK, $(grep -c '^FAIL' "$RUN_DIR/baseline.txt" || true) already failing"
+
+if [ -n "$DRILL_APP" ]; then
+    STAGE="rollback drill: $DRILL_APP is not a running service of project $MAIN_PROJECT"
+    jq -e --arg s "$DRILL_APP" --arg p "$MAIN_PROJECT" \
+        'any(.containers[]; .service == $s and .project == $p and .status == "running")' "$BASE" > /dev/null
+fi
+
+# ---- 3. Announce ----------------------------------------------------------------
+if [ -n "$DRILL_APP" ]; then
+    notify "Rollback drill for $DRILL_APP started."
+else
+    notify "Weekly update started."
+fi
+
+# ---- 4. Snapshot ----------------------------------------------------------------
+STAGE="pre-update snapshot"
+to_stop=()
+for app in $DB_APPS; do
+    if jq -e --arg s "$app" --arg p "$MAIN_PROJECT" \
+        'any(.containers[]; .service == $s and .project == $p and .status == "running")' "$BASE" > /dev/null; then
+        to_stop+=("$app")
+    fi
+done
+# Never call "stop" with an empty list: that would stop every service.
+if [ "${#to_stop[@]}" -gt 0 ]; then
+    log "Stopping for the snapshot: ${to_stop[*]}"
+    APPS_STOPPED="${to_stop[*]}"
+    docker compose -f "$MAIN_FILE" stop "${to_stop[@]}"
+fi
+/usr/local/bin/homelab-backup --tag pre-update
+start_stopped_apps
+load_restic
+restic snapshots --tag pre-update --json | jq -r 'sort_by(.time) | last | .short_id' > "$RUN_DIR/snapshot-id"
+log "Snapshot $(cat "$RUN_DIR/snapshot-id") saved. Checking 5% of the vault..."
+STAGE="checking the vault after the snapshot"
+nice -n 19 ionice -c 3 restic check --read-data-subset=5%
+
+# ---- 5. Keep the old images -----------------------------------------------------
+STAGE="keeping the old images"
+while IFS=$'\t' read -r service image_id; do
+    docker tag "$image_id" "homelab-rollback/$service:$RUN"
+done < <(jq -r '.containers[] | select(.status == "running") | [.service, .image_id] | @tsv' "$BASE")
+# Remove the rollback tags of earlier runs.
+docker images --format '{{.Repository}}:{{.Tag}}' | grep '^homelab-rollback/' | grep -v ":$RUN\$" |
+    xargs -r docker rmi > /dev/null || true
+
+docker_restarted=0
+if [ -z "$DRILL_APP" ]; then
+    # ---- 6. Debian updates ------------------------------------------------------
+    STAGE="Debian updates"
+    export DEBIAN_FRONTEND=noninteractive
+    docker_before="$(docker_started_at)"
+    apt-get -q -o DPkg::Lock::Timeout=300 update
+    apt-get -s --with-new-pkgs upgrade | grep -c '^Inst ' > "$RUN_DIR/apt-count" || true
+    log "Debian packages to upgrade: $(cat "$RUN_DIR/apt-count")"
+    apt-get -y -q -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold --with-new-pkgs upgrade
+    # A Docker update restarts Docker. Wait until it answers again.
+    STAGE="waiting for Docker after the Debian updates"
+    for _ in $(seq 1 24); do
+        if docker info > /dev/null 2>&1; then
+            break
+        fi
+        sleep 5
+    done
+    docker info > /dev/null
+    if [ "$(docker_started_at)" != "$docker_before" ]; then
+        docker_restarted=1
+        log "The Debian updates restarted Docker (all containers were restarted with it)"
+    fi
+
+    # ---- 8. New container images ------------------------------------------------
+    STAGE="updating the apps"
+    for project in "$MAIN_PROJECT" "$SIDE_PROJECT"; do
+        file="$(compose_file "$project")"
+        now="$(containers_json)"
+        mapfile -t services < <(printf '%s' "$now" | jq -r --arg p "$project" '.[] | select(.project == $p and .status == "running") | .service')
+        if [ "${#services[@]}" -eq 0 ]; then
+            continue
+        fi
+        log "Pulling images for project $project: ${services[*]}"
+        if ! docker compose -f "$file" pull --quiet "${services[@]}"; then
+            log "WARNING: some images of project $project could not be pulled. They stay as they are."
+        fi
+        to_update=()
+        for service in "${services[@]}"; do
+            image_ref="$(printf '%s' "$now" | jq -r --arg s "$service" --arg p "$project" '.[] | select(.project == $p and .service == $s) | .image_ref')"
+            old_id="$(printf '%s' "$now" | jq -r --arg s "$service" --arg p "$project" '.[] | select(.project == $p and .service == $s) | .image_id')"
+            new_id="$(docker image inspect --format '{{.Id}}' "$image_ref")"
+            if [ "$new_id" = "$old_id" ]; then
+                continue
+            fi
+            if [ "$(jq -r --arg s "$service" '.[$s] // empty' "$QUARANTINE")" = "$new_id" ]; then
+                log "  $service: the new image is quarantined (it failed before). Kept the old one."
+                docker tag "$old_id" "$image_ref"
+                continue
+            fi
+            # A different image than the quarantined one: give it a chance.
+            jq --arg s "$service" 'del(.[$s])' "$QUARANTINE" > "$QUARANTINE.tmp" && mv -f "$QUARANTINE.tmp" "$QUARANTINE"
+            to_update+=("$service")
+            printf '%s\t%s\t%s\t%s\n' "$service" "$project" "$old_id" "$new_id" >> "$RUN_DIR/updated.tsv"
+        done
+        if [ "${#to_update[@]}" -gt 0 ]; then
+            log "Recreating with new images: ${to_update[*]}"
+            docker compose -f "$file" up -d --no-deps "${to_update[@]}"
+            # qBittorrent lives inside Gluetun's network: a new Gluetun needs a new qBittorrent.
+            if printf '%s\n' "${to_update[@]}" | grep -qx gluetun && printf '%s\n' "${services[@]}" | grep -qx qbittorrent; then
+                log "Gluetun was recreated: recreating qBittorrent too"
+                docker compose -f "$file" up -d --no-deps --force-recreate qbittorrent
+            fi
+        else
+            log "Project $project: nothing to update"
+        fi
+    done
+else
+    # ---- Drill: recreate the app, then pretend its checks fail -------------------
+    STAGE="rollback drill: recreating $DRILL_APP"
+    drill_image="$(jq -r --arg s "$DRILL_APP" '.containers[] | select(.service == $s) | .image_id' "$BASE")"
+    printf '%s\t%s\t%s\t%s\n' "$DRILL_APP" "$MAIN_PROJECT" "$drill_image" "$drill_image" >> "$RUN_DIR/updated.tsv"
+    docker compose -f "$MAIN_FILE" up -d --no-deps --force-recreate "$DRILL_APP"
+fi
+
+# ---- 9. Health check after the changes ------------------------------------------
+STAGE="health check after the update"
+AFTER="$RUN_DIR/after.json"
+healthy=1
+if [ -n "$DRILL_APP" ]; then
+    log "Drill: pretending that $DRILL_APP fails its checks"
+    HOMELAB_INJECT_FAIL="$DRILL_APP" /usr/local/bin/homelab-smoke-test --json "$AFTER" > /dev/null || true
+    healthy=0
+elif ! wait_healthy "$BASE" "$AFTER"; then
+    healthy=0
+    if [ "$docker_restarted" -eq 1 ]; then
+        # Known cure for Docker's network being left in a bad state after a restart:
+        # take the media stack down and bring the same services up again.
+        # Only the "compose" project. Never the Minecraft project.
+        STAGE="recreating the media stack after the Docker restart"
+        mapfile -t stack < <(jq -r --arg p "$MAIN_PROJECT" '.containers[] | select(.project == $p and .status == "running") | .service' "$BASE")
+        log "Not healthy after Docker was restarted. Recreating the media stack: ${stack[*]}"
+        docker compose -f "$MAIN_FILE" down
+        docker compose -f "$MAIN_FILE" up -d --pull never "${stack[@]}"
+        STAGE="health check after recreating the media stack"
+        if wait_healthy "$BASE" "$AFTER"; then
+            healthy=1
+        fi
+    fi
+fi
+
+# A graphics driver that stopped working on the host is cured by a reboot, not by a rollback.
+gpu_host_broken=0
+if regressions "$BASE" "$AFTER" | grep -qx 'gpu:host'; then
+    gpu_host_broken=1
+    if [ -z "$(regressions "$BASE" "$AFTER" | grep -vx 'gpu:host' || true)" ]; then
+        log "Only the host graphics driver check fails. A reboot should cure it."
+        healthy=1
+    fi
+fi
+
+# ---- 10. Roll back what broke ----------------------------------------------------
+if [ "$healthy" -eq 0 ]; then
+    STAGE="rolling back"
+    mapfile -t blamed < <(blamed_apps "$BASE" "$AFTER")
+    to_roll=()
+    for app in "${blamed[@]}"; do
+        if cut -f1 "$RUN_DIR/updated.tsv" | grep -qx "$app"; then
+            to_roll+=("$app")
+        fi
+    done
+    log "Regressions: $(regressions "$BASE" "$AFTER" | tr '\n' ' ')"
+    log "Blamed apps: ${blamed[*]:-none}. Updated in this run and blamed: ${to_roll[*]:-none}"
+    if [ "${#to_roll[@]}" -gt 0 ]; then
+        if [ -n "$DRILL_APP" ]; then
+            /usr/local/bin/homelab-rollback --no-quarantine "$RUN" "${to_roll[@]}"
+        else
+            /usr/local/bin/homelab-rollback "$RUN" "${to_roll[@]}"
+        fi
+    fi
+    STAGE="health check after the rollback"
+    AFTER="$RUN_DIR/after-rollback.json"
+    if wait_healthy "$BASE" "$AFTER"; then
+        healthy=1
+    else
+        left="$(regressions "$BASE" "$AFTER" | grep -vx 'gpu:host' | tr '\n' ' ' || true)"
+        if [ -z "$left" ] && [ "$gpu_host_broken" -eq 1 ]; then
+            log "Only the host graphics driver check still fails. A reboot should cure it."
+            healthy=1
+        else
+            STAGE="still failing after the rollback: $left"
+            exit 1
+        fi
+    fi
+fi
+
+if [ -n "$DRILL_APP" ]; then
+    send_summary "$RUN_DIR" "Rollback drill for $DRILL_APP finished OK: it was rolled back and everything is healthy."
+    exit 0
+fi
+
+# ---- 7 + 11. Reboot ---------------------------------------------------------------
+STAGE="reboot decision"
+want_reboot=0
+if reboot_needed || [ "$gpu_host_broken" -eq 1 ] || [ "$REBOOT_MODE" = force ]; then
+    want_reboot=1
+fi
+if [ "$want_reboot" -eq 1 ] && [ "$REBOOT_MODE" != never ]; then
+    if nvidia_ready; then
+        log "Rebooting (running kernel $(uname -r), newest installed $(newest_kernel))"
+        echo "$RUN" > "$PENDING_FLAG"
+        notify "Update applied, everything healthy. Rebooting now. The final report follows after the boot."
+        REBOOTING=1
+        sync
+        systemctl reboot
+        exit 0
+    fi
+    log "Reboot needed, but the NVIDIA driver is not built for kernel $(newest_kernel). Not rebooting."
+    notify --urgent "Reboot needed but NVIDIA not ready for kernel $(newest_kernel). Not rebooting. Look: sudo dkms status"
+fi
+
+# ---- 12. Summary --------------------------------------------------------------------
+STAGE="summary"
+docker image prune -f > /dev/null || true
+if [ -s "$RUN_DIR/rolled-back.txt" ]; then
+    result="Update finished. Everything is healthy, but some apps had to be ROLLED BACK (see below)."
+else
+    result="Update finished OK."
+fi
+if [ "$want_reboot" -eq 1 ] && [ "$REBOOT_MODE" = never ]; then
+    send_summary "$RUN_DIR" "$result A reboot is needed but was skipped (--no-reboot)."
+elif [ "$want_reboot" -eq 1 ]; then
+    send_summary "$RUN_DIR" "$result The needed reboot was NOT done (NVIDIA driver not ready)."
+else
+    send_summary "$RUN_DIR" "$result No reboot needed."
+fi
+exit 0

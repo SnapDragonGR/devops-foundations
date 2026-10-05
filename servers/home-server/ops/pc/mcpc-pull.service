@@ -1,0 +1,6 @@
+[Unit]
+Description=Fetch MCPC backup snapshots onto the Archive disk
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/mcpc-pull

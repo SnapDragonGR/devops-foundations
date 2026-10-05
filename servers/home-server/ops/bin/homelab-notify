@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# homelab-notify - send a Telegram message from this machine.
+#
+#   homelab-notify "text"             normal message
+#   homelab-notify --urgent "text"    same, with a warning prefix
+#   homelab-notify --find-chat-id     look up your chat id and save it (run once)
+#
+# Sending never fails the caller: a problem is only logged, the exit code stays 0.
+set -uo pipefail
+export LC_ALL=C.UTF-8
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF="${HOMELAB_TELEGRAM_ENV:-/etc/homelab/telegram.env}"
+API="https://api.telegram.org"
+ALARM=$'\U0001F6A8'   # the red warning light sign, written as a code so this file stays plain ASCII
+TMP=""
+
+cleanup() {
+    if [ -n "$TMP" ]; then
+        rm -f -- "$TMP"
+    fi
+}
+trap cleanup EXIT
+
+problem() {
+    echo "homelab-notify: $*" >&2
+    logger -t homelab-notify -- "$*" 2>/dev/null || true
+}
+
+# Read one KEY=value line from the config file (last one wins).
+get_var() {
+    sed -n "s/^$1=//p" "$CONF" | tail -n 1 | tr -d "\"' \r\t"
+}
+
+find_chat_id() {
+    local token existing reply id
+    token="$(get_var TG_BOT_TOKEN)"
+    if [ -z "$token" ]; then
+        echo "No TG_BOT_TOKEN=... line found in $CONF" >&2
+        return 1
+    fi
+    existing="$(get_var TG_CHAT_ID)"
+    if [ -n "$existing" ]; then
+        echo "TG_CHAT_ID is already saved ($existing). Nothing changed."
+        return 0
+    fi
+    # The URL holds the token, so it goes to curl on stdin, not on the command line.
+    if ! reply="$(printf 'url = "%s/bot%s/getUpdates"\n' "$API" "$token" |
+        curl --silent --show-error --fail --max-time 15 --config -)"; then
+        echo "Telegram refused the request. Check the token in $CONF" >&2
+        return 1
+    fi
+    id="$(printf '%s' "$reply" | jq -r '[.result[] | .message.chat.id // empty] | last // empty')"
+    if ! [[ "$id" =~ ^-?[0-9]+$ ]]; then
+        echo "No message found. Send any message to your bot in Telegram, then run this again." >&2
+        return 1
+    fi
+    # Make sure the file ends with a line break before adding a new line.
+    if [ -n "$(tail -c 1 -- "$CONF")" ]; then
+        printf '\n' >> "$CONF"
+    fi
+    printf 'TG_CHAT_ID=%s\n' "$id" >> "$CONF"
+    echo "Saved TG_CHAT_ID=$id to $CONF"
+}
+
+send() {
+    local urgent="$1" text="$2" token chat
+    if [ -z "$text" ]; then
+        problem "not sent: no text given"
+        return 0
+    fi
+    token="$(get_var TG_BOT_TOKEN)"
+    chat="$(get_var TG_CHAT_ID)"
+    if [ -z "$token" ] || [ -z "$chat" ]; then
+        problem "not sent: TG_BOT_TOKEN or TG_CHAT_ID missing in $CONF"
+        return 0
+    fi
+    if [ "$urgent" -eq 1 ]; then
+        text="$ALARM [$(uname -n)] URGENT: $text"
+    else
+        text="[$(uname -n)] $text"
+    fi
+    text="${text:0:4000}"
+    TMP="$(mktemp /tmp/homelab-notify.XXXXXX)" || { problem "not sent: mktemp failed"; return 0; }
+    printf '%s' "$text" > "$TMP"
+    if ! printf 'url = "%s/bot%s/sendMessage"\n' "$API" "$token" |
+        curl --silent --show-error --fail --max-time 15 --config - \
+            --data-urlencode "chat_id=$chat" \
+            --data-urlencode "text@$TMP" \
+            --output /dev/null; then
+        problem "send failed (Telegram unreachable or refused the message)"
+    fi
+    return 0
+}
+
+if [ ! -r "$CONF" ]; then
+    problem "cannot read $CONF (run with sudo?)"
+    if [ "${1:-}" = "--find-chat-id" ]; then
+        exit 1
+    fi
+    exit 0
+fi
+
+case "${1:-}" in
+    --find-chat-id)
+        find_chat_id
+        exit $?
+        ;;
+    --urgent)
+        send 1 "${2:-}"
+        ;;
+    *)
+        send 0 "${1:-}"
+        ;;
+esac
+exit 0

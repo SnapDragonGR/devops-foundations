@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# homelab-smoke-test - the health check: test everything, print OK or FAIL per check.
+#
+#   homelab-smoke-test                  run all checks
+#   homelab-smoke-test --no-indexers    skip the slow indexer tests
+#   homelab-smoke-test --json FILE      also write the result to FILE
+#                                       (default: /var/lib/homelab-update/smoke-latest.json)
+#   HOMELAB_INJECT_FAIL=bazarr homelab-smoke-test
+#                                       testing only: every check of that app reports FAIL
+#
+# Exit code: 0 = every check OK, 1 = at least one FAIL, 2 = could not run.
+set -uo pipefail
+# shellcheck disable=SC1091
+. /usr/local/bin/homelab-lib.sh
+
+JSON_OUT="$STATE_DIR/smoke-latest.json"
+WITH_INDEXERS=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-indexers)
+            WITH_INDEXERS=0
+            ;;
+        --json)
+            if [ $# -lt 2 ]; then
+                echo "--json needs a file name" >&2
+                exit 2
+            fi
+            shift
+            JSON_OUT="$1"
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+
+INJECT="${HOMELAB_INJECT_FAIL:-}"
+FAILS=0
+WEB_OK=" "
+TSV="$(mktemp /tmp/homelab-smoke.XXXXXX)" || exit 2
+trap 'rm -f -- "$TSV"' EXIT
+mkdir -p -- "$(dirname -- "$JSON_OUT")"
+
+# record NAME BLAMES STATUS [DETAIL] : store one result and print it.
+# BLAMES is a comma-separated list of the apps this check points at.
+record() {
+    local name="$1" blames="$2" status="$3" detail="${4:-}"
+    if [ -n "$INJECT" ] && [[ ",$blames," == *",$INJECT,"* ]]; then
+        status=FAIL
+        detail="injected for testing"
+    fi
+    detail="$(printf '%s' "$detail" | tr '\t\n' '  ' | cut -c1-200)"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$status" "$blames" "$detail" >> "$TSV"
+    if [ "$status" = OK ]; then
+        echo "OK   $name"
+    else
+        echo "FAIL $name $detail"
+        FAILS=$((FAILS + 1))
+    fi
+}
+
+CONTAINERS="$(containers_json 2> /dev/null)" || CONTAINERS='[]'
+if [ -z "$CONTAINERS" ]; then
+    CONTAINERS='[]'
+fi
+
+# is_running SERVICE : true if that service has a running container.
+is_running() {
+    printf '%s' "$CONTAINERS" | jq -e --arg s "$1" 'any(.[]; .service == $s and .status == "running")' > /dev/null
+}
+
+http_code() {
+    curl -s -o /dev/null -m 10 -w '%{http_code}' "$1" 2> /dev/null || true
+}
+
+# web_check SERVICE BLAMES URL : the app's web page must answer with code 200.
+web_check() {
+    local service="$1" blames="$2" url="$3" code
+    if ! is_running "$service"; then
+        return 0
+    fi
+    code="$(http_code "$url")"
+    if [ "$code" = "200" ]; then
+        record "web:$service" "$blames" OK
+        WEB_OK="$WEB_OK $service "
+    else
+        record "web:$service" "$blames" FAIL "answer code ${code:-none} from $url"
+    fi
+}
+
+# api_key APP : read the API key from the app's config file. It is never printed.
+api_key() {
+    sed -n 's:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p' "$CONFIG_DIR/$1/config.xml" 2> /dev/null | head -n 1
+}
+
+# api_post APP URL : send an empty POST with the app's API key, print the answer.
+# The key goes to curl on stdin, not on the command line.
+api_post() {
+    local key
+    key="$(api_key "$1")"
+    if [ -z "$key" ]; then
+        return 1
+    fi
+    printf 'header = "X-Api-Key: %s"\n' "$key" | curl -s -m 180 -X POST --config - "$2" 2> /dev/null
+}
+
+# download_client_check APP PORT : the app must be able to reach qBittorrent.
+download_client_check() {
+    local app="$1" port="$2" body blames="gluetun,qbittorrent,sonarr,radarr,prowlarr"
+    if ! is_running "$app"; then
+        return 0
+    fi
+    if [[ "$WEB_OK" != *" $app "* ]]; then
+        # The app itself is down: that is the app's fault, not qBittorrent's.
+        record "downloadclient:$app" "$app" FAIL "not tested: $app itself does not answer"
+        return 0
+    fi
+    if [[ "$WEB_OK" != *" qbittorrent "* ]]; then
+        # qBittorrent itself does not answer: do not blame Sonarr, Radarr or Prowlarr for that.
+        blames="gluetun,qbittorrent"
+    fi
+    body="$(api_post "$app" "http://$HOST_IP:$port/api/v3/downloadclient/testall")" || body=""
+    if printf '%s' "$body" | jq -e 'type == "array" and length > 0 and all(.[]; .isValid == true)' > /dev/null 2>&1; then
+        record "downloadclient:$app" "$blames" OK
+    else
+        record "downloadclient:$app" "$blames" FAIL "the download client test did not pass"
+    fi
+}
+
+# indexer_checks APP PORT API : one check per indexer, so that an indexer which was
+# already dead before an update is not counted against the update.
+indexer_checks() {
+    local app="$1" port="$2" api="$3" body id valid blames="prowlarr,flaresolverr"
+    if ! is_running "$app"; then
+        return 0
+    fi
+    if [[ "$WEB_OK" != *" $app "* ]]; then
+        record "indexer:$app:api" "$app" FAIL "not tested: $app itself does not answer"
+        return 0
+    fi
+    body="$(api_post "$app" "http://$HOST_IP:$port/api/$api/indexer/testall")" || body=""
+    if ! printf '%s' "$body" | jq -e 'type == "array"' > /dev/null 2>&1; then
+        record "indexer:$app:api" "$blames" FAIL "no usable answer from the indexer test"
+        return 0
+    fi
+    record "indexer:$app:api" "$blames" OK
+    while IFS=$'\t' read -r id valid; do
+        if [ "$valid" = "true" ]; then
+            record "indexer:$app:$id" "$blames" OK
+        else
+            record "indexer:$app:$id" "$blames" FAIL "indexer number $id does not answer"
+        fi
+    done < <(printf '%s' "$body" | jq -r 'sort_by(.id) | .[] | [(.id | tostring), (.isValid | tostring)] | @tsv')
+}
+
+# ---- 1. Containers ------------------------------------------------------------
+while IFS=$'\t' read -r name service status health; do
+    if [ "$status" != "running" ]; then
+        record "container:$name" "$service" FAIL "state is $status"
+    elif [ "$health" != "none" ] && [ "$health" != "healthy" ]; then
+        record "container:$name" "$service" FAIL "health is $health"
+    else
+        record "container:$name" "$service" OK
+    fi
+done < <(printf '%s' "$CONTAINERS" | jq -r '.[] | [.name, .service, .status, .health] | @tsv')
+
+# ---- 2. Web pages -------------------------------------------------------------
+web_check sonarr sonarr "http://$HOST_IP:8989/ping"
+web_check radarr radarr "http://$HOST_IP:7878/ping"
+web_check prowlarr prowlarr "http://$HOST_IP:9696/ping"
+web_check jellyfin jellyfin "http://$HOST_IP:8096/health"
+web_check seerr seerr "http://$HOST_IP:5055/api/v1/status"
+web_check audiobookshelf audiobookshelf "http://$HOST_IP:13378/healthcheck"
+web_check bazarr bazarr "http://$HOST_IP:6767/"
+web_check flaresolverr flaresolverr "http://$HOST_IP:8191/"
+web_check cleanuparr cleanuparr "http://$HOST_IP:11011/health"
+web_check qbittorrent "qbittorrent,gluetun" "http://$HOST_IP:8080/"
+
+# ---- 3. VPN -------------------------------------------------------------------
+if is_running qbittorrent && is_running gluetun; then
+    home_address="$(curl -s -m 10 ifconfig.me 2> /dev/null || true)"
+    vpn_address="$(docker exec qbittorrent curl -s -m 10 ifconfig.me 2> /dev/null || true)"
+    if [ -z "$home_address" ] || [ -z "$vpn_address" ]; then
+        record vpn "gluetun,qbittorrent" FAIL "could not look up the public address"
+    elif [ "$home_address" = "$vpn_address" ]; then
+        record vpn "gluetun,qbittorrent" FAIL "qBittorrent uses the home address - VPN is NOT in use"
+    else
+        record vpn "gluetun,qbittorrent" OK
+    fi
+
+    v6_address="$(docker exec qbittorrent curl -6 -s -m 5 ifconfig.co 2> /dev/null || true)"
+    if [ -z "$v6_address" ]; then
+        record ipv6-leak gluetun OK
+    else
+        record ipv6-leak gluetun FAIL "qBittorrent can reach the internet over IPv6"
+    fi
+
+    gluetun_port="$(docker exec gluetun cat /tmp/gluetun/forwarded_port 2> /dev/null | tr -dc '0-9')"
+    qbit_port="$(docker exec qbittorrent curl -s -m 10 http://localhost:8080/api/v2/app/preferences 2> /dev/null |
+        jq -r '.listen_port // empty' 2> /dev/null || true)"
+    if [ -n "$gluetun_port" ] && [ "$gluetun_port" = "$qbit_port" ]; then
+        record port-forward "gluetun,qbittorrent" OK
+    else
+        record port-forward "gluetun,qbittorrent" FAIL "gluetun port '${gluetun_port:-none}', qBittorrent port '${qbit_port:-none}'"
+    fi
+fi
+
+# ---- 4. Sonarr and Radarr can reach qBittorrent ---------------------------------
+download_client_check sonarr 8989
+download_client_check radarr 7878
+
+# ---- 5. Indexers ----------------------------------------------------------------
+if [ "$WITH_INDEXERS" -eq 1 ]; then
+    indexer_checks prowlarr 9696 v1
+    indexer_checks sonarr 8989 v3
+    indexer_checks radarr 7878 v3
+fi
+
+# ---- 6. Graphics card -------------------------------------------------------------
+if nvidia-smi > /dev/null 2>&1; then
+    record gpu:host host OK
+else
+    record gpu:host host FAIL "nvidia-smi does not work on the host"
+fi
+if is_running jellyfin; then
+    if docker exec jellyfin /usr/lib/jellyfin-ffmpeg/ffmpeg -hide_banner -hwaccels 2> /dev/null | grep -qw cuda; then
+        record gpu:jellyfin jellyfin OK
+    else
+        record gpu:jellyfin jellyfin FAIL "Jellyfin's ffmpeg does not list cuda"
+    fi
+fi
+
+# ---- 7. DNS (Pi-hole) -----------------------------------------------------------
+if is_running pihole; then
+    if dig "@$HOST_IP" example.com +time=3 +tries=1 +short 2> /dev/null | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        record dns pihole OK
+    else
+        record dns pihole FAIL "no answer from $HOST_IP for example.com"
+    fi
+fi
+
+# ---- 8. Cloudflare tunnel ---------------------------------------------------------
+if is_running cloudflared; then
+    registered="$(docker logs cloudflared 2>&1 | grep -c -i 'registered tunnel connection' || true)"
+    if [ "${registered:-0}" -gt 0 ]; then
+        record tunnel cloudflared OK
+    else
+        record tunnel cloudflared FAIL "the log shows no registered connection"
+    fi
+fi
+
+# ---- 9. Media disk -----------------------------------------------------------------
+if mountpoint -q "$MEDIA_MOUNT" && touch "$MEDIA_MOUNT/.homelab-write-test" 2> /dev/null; then
+    rm -f -- "$MEDIA_MOUNT/.homelab-write-test"
+    record disk host OK
+else
+    record disk host FAIL "$MEDIA_MOUNT is not mounted or not writable"
+fi
+
+# ---- 10. Nothing may be restarting in a loop --------------------------------------
+# Compare the restart counters now with those from the start of this run.
+AFTER="$(containers_json 2> /dev/null)" || AFTER='[]'
+looping="$(jq -r -n --argjson a "$CONTAINERS" --argjson b "${AFTER:-[]}" '
+    ($b | map({key: .id, value: .restarts}) | from_entries) as $later
+    | $a[] | select(.status == "running")
+    | select(($later[.id] // -1) != .restarts) | .name' 2> /dev/null | tr '\n' ' ')"
+if [ -z "$looping" ]; then
+    record restart-loops host OK
+else
+    record restart-loops host FAIL "restarted or vanished during the check: $looping"
+fi
+
+# ---- Result file ---------------------------------------------------------------------
+if jq -R -s --arg time "$(date -Is)" --argjson containers "$CONTAINERS" '{
+        time: $time,
+        containers: $containers,
+        checks: [split("\n")[] | select(length > 0) | split("\t")
+                 | {name: .[0], status: .[1], blames: (.[2] | split(",")), detail: (.[3] // "")}]
+    }' "$TSV" > "$JSON_OUT.tmp"; then
+    mv -f -- "$JSON_OUT.tmp" "$JSON_OUT"
+else
+    echo "Could not write $JSON_OUT" >&2
+    exit 2
+fi
+
+if [ "$FAILS" -gt 0 ]; then
+    exit 1
+fi
+exit 0

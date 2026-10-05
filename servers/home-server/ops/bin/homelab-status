@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# homelab-status - one look at backups and updates. Changes nothing.
+set -uo pipefail
+# shellcheck disable=SC1091
+. /usr/local/bin/homelab-lib.sh
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+load_restic
+
+echo "== Last update"
+cat "$LAST_RESULT" 2> /dev/null || echo "no update has run yet"
+if [ -e "$PENDING_FLAG" ]; then
+    echo "WAITING: an after-reboot check is pending ($PENDING_FLAG)"
+fi
+echo
+echo "== Quarantined images (app: image that failed)"
+jq -r 'to_entries[] | "\(.key): \(.value[7:19])"' "$QUARANTINE" 2> /dev/null || true
+echo
+echo "== Timers"
+systemctl list-timers 'homelab-*' --no-pager 2> /dev/null | head -n 6
+echo
+echo "== Last backup"
+restic snapshots --tag config --json 2> /dev/null |
+    jq -r 'if length == 0 then "none yet" else (sort_by(.time) | last | "\(.time[0:19]) (snapshot \(.short_id))") end'
+echo
+echo "== Snapshots in the vault"
+restic snapshots --compact

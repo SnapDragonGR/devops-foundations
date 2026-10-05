@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+# homelab-backup - save the server's settings (not the media) into the restic vault.
+#
+#   homelab-backup                   settings only, tag "config"
+#   homelab-backup --nightly         settings + Minecraft world, then tidy old snapshots
+#                                    and spot-check the vault
+#   homelab-backup --minecraft-only  only the Minecraft world, tag "minecraft"
+#   homelab-backup --tag NAME        settings only, with another tag
+#                                    (the update job will use "pre-update")
+#
+# Exit codes: 0 = OK, 75 = another backup is already running, anything else = failed.
+set -euo pipefail
+umask 027
+shopt -s nullglob
+export LC_ALL=C.UTF-8
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly CONFIG_DIR=/srv/media/config
+readonly MEDIA_MOUNT=/srv/media/data
+readonly STAGING=/srv/media/data/backups/staging
+readonly RESTIC_ENV=/etc/homelab/restic.env
+readonly LOCK_FILE=/run/homelab-backup.lock
+readonly COMPOSE_FILES=(
+    /home/gleb/devops-foundations/servers/home-server/compose/docker-compose.yml
+    /home/gleb/devops-foundations/servers/mc-server/docker-compose.yml
+)
+readonly MC_DIR=/home/gleb/minecraft-fabric
+readonly MC_PROJECT=minecraft-fabric
+readonly MC_SERVICE=mc
+
+TAG=config
+NIGHTLY=0
+DO_CONFIG=1
+DO_MINECRAFT=0
+STAGE="starting"
+DB_OK=0
+DB_FAILED=0
+WARNINGS=0
+MC_PAUSED_ID=""
+
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*"; }
+notify() { /usr/local/bin/homelab-notify "$@" || true; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --nightly)
+            NIGHTLY=1
+            DO_MINECRAFT=1
+            ;;
+        --minecraft-only)
+            DO_CONFIG=0
+            DO_MINECRAFT=1
+            ;;
+        --tag)
+            if [ $# -lt 2 ]; then
+                echo "--tag needs a name" >&2
+                exit 2
+            fi
+            shift
+            TAG="$1"
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if ! [[ "$TAG" =~ ^[a-z0-9-]+$ ]]; then
+    echo "Bad tag name: '$TAG' (use small letters, digits and '-')" >&2
+    exit 2
+fi
+if [ "$DO_CONFIG" -eq 0 ] && [ "$NIGHTLY" -eq 1 ]; then
+    echo "Use either --nightly or --minecraft-only, not both." >&2
+    exit 2
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+
+# If Minecraft's world saving was paused for the backup, switch it back on.
+resume_minecraft() {
+    if [ -n "$MC_PAUSED_ID" ]; then
+        docker exec "$MC_PAUSED_ID" rcon-cli save-on > /dev/null ||
+            log "WARNING: could not switch Minecraft world saving back on"
+        MC_PAUSED_ID=""
+    fi
+}
+
+# From here on, any failure sends one urgent Telegram message.
+on_exit() {
+    local code=$?
+    trap - EXIT
+    resume_minecraft
+    if [ "$code" -ne 0 ] && [ "$code" -ne 75 ]; then
+        log "FAILED during: $STAGE (exit code $code)"
+        notify --urgent "Backup FAILED during: $STAGE (exit code $code). Look: sudo journalctl -u homelab-backup -n 50"
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+# Only one backup at a time.
+exec 9> "$LOCK_FILE"
+if ! flock -n 9; then
+    log "Another backup is already running. Stopping."
+    exit 75
+fi
+
+# Be gentle: lowest CPU and disk priority for this script and everything it starts.
+renice -n 19 -p $$ > /dev/null || true
+ionice -c 3 -p $$ || true
+
+STAGE="checking the vault"
+if ! mountpoint -q "$MEDIA_MOUNT"; then
+    log "ERROR: $MEDIA_MOUNT is not mounted"
+    exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+. "$RESTIC_ENV"
+set +a
+export RESTIC_CACHE_DIR=/var/cache/homelab-restic
+install -d -m 700 -o root -g root "$RESTIC_CACHE_DIR"
+if [ ! -f "$RESTIC_REPOSITORY/config" ]; then
+    log "ERROR: no vault found at $RESTIC_REPOSITORY"
+    exit 1
+fi
+
+# run_restic_backup TAG ARGS... : one restic backup. Stops the script on a real failure.
+run_restic_backup() {
+    local tag="$1" rc=0
+    shift
+    restic backup --tag "$tag" "$@" || rc=$?
+    if [ "$rc" -eq 3 ]; then
+        # restic code 3 = snapshot saved, but some files could not be read (e.g. deleted meanwhile).
+        log "WARNING: snapshot saved, but some files could not be read"
+        WARNINGS=1
+    elif [ "$rc" -ne 0 ]; then
+        exit "$rc"
+    fi
+}
+
+# save NAME COMMAND... : store a command's output in host-state. Never stops the backup.
+save() {
+    local name="$1"
+    shift
+    if ! "$@" > "$STAGING/host-state/$name" 2>&1; then
+        log "  note: could not collect $name"
+    fi
+}
+running_images() {
+    docker ps -q | xargs -r docker inspect --format '{{.Name}} {{.Config.Image}} {{.Image}}'
+}
+
+# add_path PATH : put PATH on the backup list if it exists.
+# If it is a link, also save what it points to.
+add_path() {
+    local p="$1" real
+    if [ ! -e "$p" ]; then
+        log "  not found, skipped: $p"
+        return 0
+    fi
+    printf '%s\n' "$p" >> "$STAGING/backup-list.txt"
+    real="$(realpath -e -- "$p")"
+    if [ "$real" != "$p" ]; then
+        printf '%s\n' "$real" >> "$STAGING/backup-list.txt"
+    fi
+}
+
+backup_config() {
+    local src dest f p
+    log "Settings backup started (tag: $TAG)"
+
+    # ---- 1. Safe copies of every database ----------------------------------
+    STAGE="copying databases"
+    rm -rf -- "${STAGING:?}"
+    install -d -m 700 -o root -g root "$STAGING" "$STAGING/db" "$STAGING/host-state"
+
+    # Things that never go into the vault.
+    printf '%s\n' \
+        "$CONFIG_DIR/npm" \
+        "$CONFIG_DIR/**/log" \
+        "$CONFIG_DIR/**/logs" \
+        "$CONFIG_DIR/jellyfin/cache" \
+        "$CONFIG_DIR/jellyfin/**/transcodes" \
+        > "$STAGING/exclude-list.txt"
+
+    while IFS= read -r -d '' src; do
+        # A real SQLite file starts with these 15 letters. Anything else is saved as a normal file.
+        if [ "$(head -c 15 -- "$src" | tr -d '\0')" != "SQLite format 3" ]; then
+            log "  not a SQLite file, saved as a normal file: $src"
+            continue
+        fi
+        dest="$STAGING/db$src"
+        mkdir -p -- "$(dirname -- "$dest")"
+        if sqlite3 "$src" ".timeout 30000" ".backup '$dest'" && [ -s "$dest" ]; then
+            chown --reference="$src" -- "$dest"
+            chmod --reference="$src" -- "$dest"
+            # The safe copy replaces the live file (and its helper files) in the backup.
+            printf '%s\n' "$src" "$src-wal" "$src-shm" "$src-journal" >> "$STAGING/exclude-list.txt"
+            DB_OK=$((DB_OK + 1))
+        else
+            # Fall back to saving the live file, and report the problem at the end.
+            log "  WARNING: safe copy failed, live file saved instead: $src"
+            rm -f -- "$dest"
+            DB_FAILED=$((DB_FAILED + 1))
+        fi
+    done < <(find "$CONFIG_DIR" -path "$CONFIG_DIR/npm" -prune -o -type f \
+        \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -print0 | sort -z)
+    log "Databases copied safely: $DB_OK, failed: $DB_FAILED"
+
+    # ---- 2. A description of the host (to rebuild it later) ----------------
+    STAGE="collecting host state"
+    save dpkg-selections.txt dpkg --get-selections
+    save apt-manual.txt apt-mark showmanual
+    save kernel.txt uname -r
+    save timers.txt systemctl list-timers --all --no-pager
+    save lsblk.txt lsblk -f
+    save findmnt.txt findmnt
+    save containers.txt docker ps -a --format '{{.Names}} {{.Image}} {{.Status}}'
+    save running-images.txt running_images
+    if command -v dkms > /dev/null 2>&1; then
+        save dkms-status.txt dkms status
+    else
+        echo "dkms is not installed" > "$STAGING/host-state/dkms-status.txt"
+    fi
+    if command -v nvidia-smi > /dev/null 2>&1; then
+        save nvidia-smi.txt nvidia-smi
+    fi
+    for f in "${COMPOSE_FILES[@]}"; do
+        if [ -f "$f" ]; then
+            save "compose-config-$(basename "$(dirname "$f")").yml" docker compose -f "$f" config
+        fi
+    done
+
+    # ---- 3. The list of things to save -------------------------------------
+    STAGE="building the file list"
+    : > "$STAGING/backup-list.txt"
+    add_path "$CONFIG_DIR"
+    add_path "$STAGING"
+    add_path /srv/media/compose/.env
+    add_path /home/gleb/devops-foundations/servers/home-server/compose/.env
+    add_path /home/gleb/devops-foundations/servers/mc-server/.env
+    add_path /home/gleb/minecraft-fabric/.env
+    add_path /srv/media/scripts
+    add_path /etc/fstab
+    add_path /etc/ssh/sshd_config
+    add_path /etc/ssh/sshd_config.d
+    add_path /etc/docker/daemon.json
+    add_path /etc/firewalld
+    add_path /etc/homelab
+    for p in /usr/local/bin/homelab-* /etc/systemd/system/homelab-* /etc/systemd/system/audiobook-import.*; do
+        add_path "$p"
+    done
+    sort -u -o "$STAGING/backup-list.txt" "$STAGING/backup-list.txt"
+
+    # ---- 4. The backup itself -----------------------------------------------
+    STAGE="restic backup of the settings"
+    run_restic_backup "$TAG" \
+        --files-from-verbatim "$STAGING/backup-list.txt" \
+        --exclude-file "$STAGING/exclude-list.txt"
+}
+
+backup_minecraft() {
+    local id
+    local paths=()
+    STAGE="Minecraft backup"
+    log "Minecraft backup started (tag: minecraft)"
+    if [ ! -d "$MC_DIR/minecraft-data" ]; then
+        log "ERROR: $MC_DIR/minecraft-data not found"
+        exit 1
+    fi
+    paths+=("$MC_DIR/minecraft-data")
+    if [ -d "$MC_DIR/mods" ]; then
+        paths+=("$MC_DIR/mods")
+    fi
+
+    # Is the Minecraft container running right now? (Found by its compose labels.)
+    id="$(docker ps -q \
+        --filter "label=com.docker.compose.project=$MC_PROJECT" \
+        --filter "label=com.docker.compose.service=$MC_SERVICE" 2> /dev/null | head -n 1)" || id=""
+    if [ -n "$id" ]; then
+        # A running server rewrites world files all the time. Pause that, write out
+        # everything, back up, and switch saving on again (also done on any failure).
+        log "  Minecraft is running: world saving is paused during the backup"
+        MC_PAUSED_ID="$id"
+        docker exec "$id" rcon-cli save-off > /dev/null
+        docker exec "$id" rcon-cli save-all flush > /dev/null
+    else
+        log "  Minecraft is not running: files are copied as they are"
+    fi
+
+    run_restic_backup minecraft \
+        --exclude "$MC_DIR/minecraft-data/logs" \
+        --exclude "$MC_DIR/minecraft-data/crash-reports" \
+        --exclude "$MC_DIR/minecraft-data/cache" \
+        --exclude "$MC_DIR/minecraft-data/libraries" \
+        --exclude "$MC_DIR/minecraft-data/versions" \
+        --exclude "$MC_DIR/minecraft-data/.fabric" \
+        --exclude "$MC_DIR/**/*.log" \
+        --exclude "$MC_DIR/**/*.log.gz" \
+        "${paths[@]}"
+    resume_minecraft
+}
+
+if [ "$DO_CONFIG" -eq 1 ]; then
+    backup_config
+fi
+if [ "$DO_MINECRAFT" -eq 1 ]; then
+    backup_minecraft
+fi
+
+# ---- Nightly housekeeping ----------------------------------------------------
+if [ "$NIGHTLY" -eq 1 ]; then
+    STAGE="tidying old snapshots"
+    # Every tag (config, minecraft, pre-update) is tidied on its own.
+    if [ "$(date +%u)" -eq 7 ]; then
+        # Sunday: also free the disk space of forgotten snapshots.
+        restic forget --group-by host,tags \
+            --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+    else
+        restic forget --group-by host,tags \
+            --keep-daily 7 --keep-weekly 4 --keep-monthly 6
+    fi
+    STAGE="spot-checking the vault"
+    restic check --read-data-subset=2%
+fi
+
+# ---- Report --------------------------------------------------------------------
+STAGE="writing the report"
+if [ "$DO_CONFIG" -eq 1 ]; then
+    report_tag="$TAG"
+else
+    report_tag=minecraft
+fi
+snapshots_json="$(restic snapshots --tag "$report_tag" --json)"
+snap_id="$(printf '%s' "$snapshots_json" | jq -r 'sort_by(.time) | last | .short_id')"
+snap_count="$(printf '%s' "$snapshots_json" | jq -r 'length')"
+vault_size="$(du -sh -- "$RESTIC_REPOSITORY" | cut -f1)"
+
+if [ "$DB_FAILED" -gt 0 ]; then
+    STAGE="copying databases ($DB_FAILED could not be copied safely; snapshot $snap_id was still saved)"
+    exit 1
+fi
+if [ "$WARNINGS" -eq 1 ]; then
+    notify "Backup saved (snapshot $snap_id), but some files could not be read. Look: sudo journalctl -u homelab-backup -n 80"
+elif [ "$DO_CONFIG" -eq 0 ]; then
+    notify "Minecraft backup finished in $((SECONDS / 60)) min (snapshot $snap_id, vault size $vault_size)."
+elif [ "$NIGHTLY" -eq 1 ] && [ "$(date +%u)" -eq 7 ]; then
+    notify "Backup OK. Newest snapshot $snap_id, $snap_count '$report_tag' snapshots kept, vault size $vault_size."
+fi
+log "Backup finished OK in ${SECONDS}s (snapshot $snap_id, vault size $vault_size)"
+exit 0

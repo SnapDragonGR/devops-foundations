@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# mcpc-restore-test - monthly proof that the copy on the Archive disk can be restored.
+#
+# Restores the newest settings snapshot to a temporary folder on the Archive disk,
+# tests every database, re-reads 5% of the vault, reports on Telegram, cleans up.
+set -euo pipefail
+umask 077
+export LC_ALL=C.UTF-8
+
+ARCHIVE_MOUNT=/mnt/archive
+VAULT="$ARCHIVE_MOUNT/mcpc-backups/restic"
+WORK="$ARCHIVE_MOUNT/mcpc-backups/restore-test.tmp"
+CONF_DIR="$HOME/.config/mcpc-backup"
+PASSWORD_FILE="$CONF_DIR/password"
+export HOMELAB_TELEGRAM_ENV="$CONF_DIR/telegram.env"
+
+STAGE="starting"
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*"; }
+notify() { "$HOME/.local/bin/homelab-notify" "$@" || true; }
+
+clean_up() {
+    if [ -d "$WORK" ]; then
+        chmod -R u+rwX -- "$WORK" 2> /dev/null || true
+        rm -rf -- "$WORK"
+    fi
+}
+on_exit() {
+    local code=$?
+    trap - EXIT
+    clean_up
+    if [ "$code" -ne 0 ]; then
+        log "FAILED during: $STAGE"
+        notify --urgent "Restore test FAILED during: $STAGE. Look: journalctl --user -u mcpc-restore-test -n 50"
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+restic_pc() {
+    nice -n 19 ionice -c 3 restic -r "$VAULT" --password-file "$PASSWORD_FILE" "$@"
+}
+
+STAGE="checking the Archive disk"
+if ! mountpoint -q "$ARCHIVE_MOUNT"; then
+    log "$ARCHIVE_MOUNT is not a mounted disk"
+    exit 1
+fi
+if [ ! -f "$VAULT/config" ]; then
+    log "no vault found at $VAULT"
+    exit 1
+fi
+
+STAGE="restoring the newest settings snapshot"
+clean_up
+mkdir -- "$WORK"
+restic_pc restore latest --tag config --target "$WORK"
+
+STAGE="testing the restored databases"
+db_dir="$WORK/srv/media/data/backups/staging/db"
+total=0
+bad=0
+while IFS= read -r -d '' f; do
+    total=$((total + 1))
+    result="$(sqlite3 "$f" 'PRAGMA integrity_check;' 2>&1 | head -n 1)"
+    if [ "$result" != "ok" ]; then
+        bad=$((bad + 1))
+        log "  NOT ok: ${f#"$db_dir"} -> $result"
+    fi
+done < <(find "$db_dir" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -print0)
+log "Databases tested: $total, not ok: $bad"
+if [ "$total" -eq 0 ] || [ "$bad" -gt 0 ]; then
+    STAGE="testing the restored databases ($total tested, $bad not ok)"
+    exit 1
+fi
+
+STAGE="re-reading 5% of the vault"
+restic_pc check --read-data-subset=5%
+
+notify "Restore test OK: $total databases fine, vault check passed."
+log "Restore test OK"
+exit 0

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# homelab-rollback - put apps back exactly as they were before an update run.
+#
+#   homelab-rollback RUN APP [APP...]
+#   homelab-rollback --no-quarantine RUN APP [APP...]    (used by the rollback drill)
+#
+# RUN is the run name, e.g. 20261008-020000 (see /var/lib/homelab-update/run-*).
+# For every app: stop it, move its settings folder aside as <folder>.failed-<RUN>,
+# restore the folder from the run's pre-update snapshot, point the image name back
+# at the old image, start the app. The image that failed is remembered (quarantined)
+# so the next update does not install it again.
+set -euo pipefail
+# shellcheck disable=SC1091
+. /usr/local/bin/homelab-lib.sh
+# systemd starts services without a HOME. Docker's tools expect one.
+export HOME="${HOME:-/root}"
+
+USE_QUARANTINE=1
+if [ "${1:-}" = "--no-quarantine" ]; then
+    USE_QUARANTINE=0
+    shift
+fi
+if [ $# -lt 2 ]; then
+    echo "Usage: homelab-rollback [--no-quarantine] RUN APP [APP...]" >&2
+    exit 2
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run this with sudo." >&2
+    exit 2
+fi
+RUN="$1"
+shift
+RUN_DIR="$STATE_DIR/run-$RUN"
+BASE="$RUN_DIR/baseline.json"
+if [ ! -s "$BASE" ] || [ ! -s "$RUN_DIR/snapshot-id" ]; then
+    echo "No usable run found in $RUN_DIR" >&2
+    exit 2
+fi
+SNAPSHOT="$(cat "$RUN_DIR/snapshot-id")"
+load_restic
+if [ ! -s "$QUARANTINE" ]; then
+    echo '{}' > "$QUARANTINE"
+fi
+
+# field APP NAME : read one fact about the app as it was before the run.
+field() {
+    jq -r --arg s "$1" --arg f "$2" '.containers[] | select(.service == $s) | .[$f]' "$BASE" | head -n 1
+}
+was_running() {
+    [ "$(field "$1" status)" = "running" ]
+}
+
+# If the rollback cannot finish, do not leave the apps stopped: start them as they are.
+STOPPED=0
+apps=()
+on_exit() {
+    local code=$? app
+    trap - EXIT
+    if [ "$code" -ne 0 ] && [ "$STOPPED" -eq 1 ]; then
+        log "ERROR: the rollback did not finish (exit code $code). Starting the apps again as they are now."
+        for app in "${apps[@]}"; do
+            docker compose -f "$(compose_file "$(field "$app" project)")" up -d --no-deps --pull never "$app" ||
+                log "ERROR: could not start $app"
+        done
+    fi
+    exit "$code"
+}
+trap on_exit EXIT
+
+# The list of apps. Gluetun and qBittorrent always go together.
+apps=("$@")
+if printf '%s\n' "${apps[@]}" | grep -qx gluetun && ! printf '%s\n' "${apps[@]}" | grep -qx qbittorrent; then
+    if was_running qbittorrent; then
+        apps+=(qbittorrent)
+    fi
+fi
+for app in "${apps[@]}"; do
+    if ! was_running "$app"; then
+        echo "$app was not a running service before run $RUN. Nothing was changed." >&2
+        exit 2
+    fi
+    if ! docker image inspect "homelab-rollback/$app:$RUN" > /dev/null 2>&1; then
+        echo "The old image homelab-rollback/$app:$RUN is missing. Nothing was changed." >&2
+        exit 2
+    fi
+done
+log "Rolling back to the state before run $RUN (snapshot $SNAPSHOT): ${apps[*]}"
+
+# ---- 1. Stop --------------------------------------------------------------------
+STOPPED=1
+for app in "${apps[@]}"; do
+    docker compose -f "$(compose_file "$(field "$app" project)")" stop "$app"
+done
+
+# ---- 2. Settings folders ---------------------------------------------------------
+# The safe database copies of all apps are restored once into a work folder.
+WORK="$RUN_DIR/restore-work"
+rm -rf -- "${WORK:?}"
+mkdir -p -- "$WORK"
+restic restore "$SNAPSHOT" --include "$STAGING/db" --target "$WORK" > /dev/null
+
+for app in "${apps[@]}"; do
+    folder="$(config_folder "$app")"
+    if [ -z "$folder" ] || [ ! -d "$folder" ]; then
+        log "  $app: no settings folder, only the image is rolled back"
+        continue
+    fi
+    failed="$folder.failed-$RUN"
+    if [ -e "$failed" ]; then
+        failed="$failed-$(date +%H%M%S)"
+    fi
+    mv -- "$folder" "$failed"
+    log "  $app: settings moved aside to $failed"
+    if ! restic restore "$SNAPSHOT" --include "$folder" --target / > /dev/null || [ ! -d "$folder" ]; then
+        # The restore failed: put the folder back rather than leave the app without one.
+        if [ -e "$folder" ]; then
+            mv -- "$folder" "$folder.partial-$RUN"
+        fi
+        mv -- "$failed" "$folder"
+        log "ERROR: $app: restoring $folder failed. The folder was put back unchanged."
+        exit 1
+    fi
+    # Databases are kept apart in the snapshot (as safe copies). Put them in place,
+    # file by file, so that the folders keep the owner and mode they were restored with.
+    if [ -d "$WORK$STAGING/db$folder" ]; then
+        while IFS= read -r -d '' db; do
+            if [ ! -d "$(dirname -- "$folder/$db")" ]; then
+                mkdir -p -- "$(dirname -- "$folder/$db")"
+                chown --reference="$(dirname -- "$failed/$db")" -- "$(dirname -- "$folder/$db")"
+            fi
+            cp -a -- "$WORK$STAGING/db$folder/$db" "$folder/$db"
+        done < <(cd "$WORK$STAGING/db$folder" && find . -type f -print0)
+    fi
+    # Log folders are not in the backup. Recreate the empty folders, because other
+    # containers (fail2ban) mount some of them.
+    while IFS= read -r -d '' dir; do
+        if [ ! -e "$folder/$dir" ]; then
+            mkdir -p -- "$folder/$dir"
+            chown --reference="$failed/$dir" -- "$folder/$dir"
+            chmod --reference="$failed/$dir" -- "$folder/$dir"
+        fi
+    done < <(cd "$failed" && find . -maxdepth 3 -type d \( -path './log' -o -path './log/*' -o -path './logs' -o -path './logs/*' \) -print0 | sort -z)
+    log "  $app: settings restored from snapshot $SNAPSHOT"
+done
+rm -rf -- "${WORK:?}"
+
+# ---- 3. Images --------------------------------------------------------------------
+for app in "${apps[@]}"; do
+    docker tag "homelab-rollback/$app:$RUN" "$(field "$app" image_ref)"
+    bad_id="$(awk -F'\t' -v a="$app" '$1 == a {print $4}' "$RUN_DIR/updated.tsv" 2> /dev/null | tail -n 1)"
+    if [ "$USE_QUARANTINE" -eq 1 ] && [ -n "$bad_id" ] && [ "$bad_id" != "$(field "$app" image_id)" ]; then
+        jq --arg s "$app" --arg id "$bad_id" '.[$s] = $id' "$QUARANTINE" > "$QUARANTINE.tmp"
+        mv -f -- "$QUARANTINE.tmp" "$QUARANTINE"
+        log "  $app: image ${bad_id:7:12} is quarantined"
+    fi
+done
+
+# ---- 4. Start (Gluetun first, qBittorrent fresh inside it) --------------------------
+for app in "${apps[@]}"; do
+    if [ "$app" != "qbittorrent" ]; then
+        docker compose -f "$(compose_file "$(field "$app" project)")" up -d --no-deps --pull never "$app"
+    fi
+done
+if printf '%s\n' "${apps[@]}" | grep -qx qbittorrent; then
+    docker compose -f "$MAIN_FILE" up -d --no-deps --pull never --force-recreate qbittorrent
+fi
+# fail2ban reads the log folders of swag and jellyfin: restart it so it sees the new folders.
+if printf '%s\n' "${apps[@]}" | grep -qxE 'swag|jellyfin' && was_running fail2ban && ! printf '%s\n' "${apps[@]}" | grep -qx fail2ban; then
+    docker compose -f "$MAIN_FILE" restart fail2ban
+fi
+
+printf '%s\n' "${apps[@]}" >> "$RUN_DIR/rolled-back.txt"
+log "Rollback done: ${apps[*]}"
+exit 0

@@ -1,0 +1,10 @@
+[Unit]
+Description=Homelab weekly update (snapshot, Debian, containers, health check)
+After=network-online.target docker.service
+Wants=network-online.target
+OnFailure=homelab-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/homelab-update

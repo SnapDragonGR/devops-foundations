@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# mcpc-pull - fetch new snapshots from the server's vault into the vault on the Archive disk.
+#
+# The server is only read (the login is read-only). This PC's copy keeps
+# 14 daily / 8 weekly / 12 monthly snapshots.
+set -euo pipefail
+umask 077
+export LC_ALL=C.UTF-8
+
+ARCHIVE_MOUNT="${MCPC_ARCHIVE_MOUNT:-/mnt/archive}"
+VAULT="$ARCHIVE_MOUNT/mcpc-backups/restic"
+SOURCE="sftp:mcpc-backup:/srv/media/data/backups/restic"
+SOURCE_CONFIG_FILE=/srv/media/data/backups/restic/config
+CONF_DIR="$HOME/.config/mcpc-backup"
+STATE_DIR="$HOME/.local/state/mcpc-backup"
+PASSWORD_FILE="$CONF_DIR/password"
+MAX_AGE_DAYS=8
+export HOMELAB_TELEGRAM_ENV="$CONF_DIR/telegram.env"
+
+log() { printf '%s  %s\n' "$(date '+%F %T')" "$*"; }
+notify() { "$HOME/.local/bin/homelab-notify" "$@" || true; }
+
+# notify_once_a_day KEY TEXT : send TEXT, but at most once per day for the same KEY.
+notify_once_a_day() {
+    local key="$1" text="$2" stamp today
+    stamp="$STATE_DIR/alert-$key"
+    today="$(date +%F)"
+    if [ -f "$stamp" ] && [ "$(cat -- "$stamp")" = "$today" ]; then
+        return 0
+    fi
+    notify --urgent "$text"
+    printf '%s\n' "$today" > "$stamp"
+}
+
+mkdir -p -- "$STATE_DIR"
+
+# Only one run at a time.
+exec 9> "$STATE_DIR/lock"
+if ! flock -n 9; then
+    log "Another run is still busy. Stopping."
+    exit 0
+fi
+
+# 1. Is the Archive disk really there? Without this check a missing disk would
+#    make restic fill the PC's system disk instead.
+if ! mountpoint -q "$ARCHIVE_MOUNT"; then
+    log "REFUSED: $ARCHIVE_MOUNT is not a mounted disk. Nothing was copied."
+    notify_once_a_day not-mounted "Backup copy skipped: the Archive disk is not mounted at $ARCHIVE_MOUNT."
+    exit 1
+fi
+if [ ! -f "$VAULT/config" ]; then
+    log "REFUSED: no vault found at $VAULT. Nothing was copied."
+    notify_once_a_day no-vault "Backup copy skipped: no vault found at $VAULT."
+    exit 1
+fi
+
+restic_pc() {
+    nice -n 19 ionice -c 3 restic -r "$VAULT" --password-file "$PASSWORD_FILE" "$@"
+}
+
+# 2. Fetch new snapshots, if the server answers within 10 seconds.
+failed=0
+if printf 'ls %s\n' "$SOURCE_CONFIG_FILE" |
+    sftp -q -b - -o ConnectTimeout=10 mcpc-backup > /dev/null 2>&1; then
+    log "Server answers. Copying new snapshots..."
+    if restic_pc copy --from-repo "$SOURCE" --from-password-file "$PASSWORD_FILE" --no-lock; then
+        log "Copy finished."
+        # 3. Tidy old snapshots here. Once a week also free the disk space.
+        if [ ! -e "$STATE_DIR/last-prune" ] || [ -n "$(find "$STATE_DIR/last-prune" -mtime +6)" ]; then
+            if restic_pc forget --group-by host,tags \
+                --keep-daily 14 --keep-weekly 8 --keep-monthly 12 --prune; then
+                touch -- "$STATE_DIR/last-prune"
+            else
+                failed=1
+            fi
+        else
+            restic_pc forget --group-by host,tags \
+                --keep-daily 14 --keep-weekly 8 --keep-monthly 12 || failed=1
+        fi
+    else
+        failed=1
+    fi
+    if [ "$failed" -eq 1 ]; then
+        log "ERROR: copying or tidying failed."
+        notify_once_a_day pull-failed "Backup copy from MCPC failed. Look: journalctl --user -u mcpc-pull -n 50"
+    fi
+else
+    log "Server does not answer (off, or this PC is away). Nothing copied this time."
+fi
+
+# 4. Is the newest snapshot here too old? (Checked even when the server is silent.)
+newest="$(restic_pc snapshots --json | jq -r 'map(.time) | max // empty')"
+if [ -z "$newest" ]; then
+    log "WARNING: the vault on this PC holds no snapshots yet."
+    notify_once_a_day stale "The backup copy on this PC holds no snapshots yet."
+    exit 1
+fi
+age_days=$(( ($(date +%s) - $(date -d "$newest" +%s)) / 86400 ))
+log "Newest snapshot here: $newest ($age_days days old)"
+if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
+    notify_once_a_day stale "The newest backup copy on this PC is $age_days days old (limit: $MAX_AGE_DAYS). Is MCPC still making backups?"
+    exit 1
+fi
+exit "$failed"
