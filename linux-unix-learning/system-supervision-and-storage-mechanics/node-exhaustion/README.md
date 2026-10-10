@@ -16,4 +16,4 @@
 * `| uniq -c` to count the adjacent grouped occurrences
 * `| sort -n` to sort the list numerically, exposing the directory holding millions of files at the bottom of the output  
   
-* `find /path/to/cache -type f -delet` to actually delete those millions of files, since rm would fail (too many arguments)
+* `find /path/to/cache -type f -delete` to actually delete those millions of files, since rm would fail (too many arguments)
