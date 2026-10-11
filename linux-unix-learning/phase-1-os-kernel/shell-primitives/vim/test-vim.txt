@@ -1,4 +1,0 @@
-testing vim
-sentence one
-sentence two
-saving changes
