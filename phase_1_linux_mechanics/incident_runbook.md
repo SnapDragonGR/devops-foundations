@@ -31,3 +31,52 @@ The VFS layer requires both the directory hard link count AND the process refere
 *   **Symptom:** The `/mnt/prod_data` partition was mounted manually and would not survive a reboot.
 *   **Root Cause:** The VFS tree is rebuilt entirely on boot. 
 *   **Remediation Command(s):** `echo "/tmp/prod-data.img /mnt/prod_data ext4 loop,defaults 0 0" | sudo tee -a /etc/fstab`
+
+# INCIDENT: Phase 1 Outage (Kernel, Storage & Supervision)
+**Incident Date:** 2026-10-12
+**Severity:** P1 - Critical Outage
+
+## 1. Rogue Process & Kernel Signaling
+*   **Symptom:** Core CPU utilization pegged at 100%. Process refused graceful shutdown.
+*   **Root Cause:** - rogue process hopped the entire cpu as shown in `top` output. SIGTERM failed due to user-space delivery. Kill -9 is the brutal force here, cant be caught, direct scheduler handling.
+*   **Triage & Resolution Commands:**
+    *   `top`
+    *   `sudo cat /proc/5514/oom_score`
+    *   `sudo kill -9 5514`
+
+## 2. Unlinked Open File (Ghost Storage)
+*   **Symptom:** 200MB disk capacity held on root partition; invisible to directory scans (`du`).
+*   **Root Cause:** hard link count dropped to 0, but the process reference count was greater than 0. Have to kill the process to close the file descriptor.
+*   **Triage & Resolution Commands:**
+    *   `sudo lsof +aL1`
+    *   `sudo su` & `> /proc/5546/fd/3`
+    *   `cd /var/log` & `df -h`
+
+## 3. Inode Depletion & Mount Persistence
+*   **Symptom:** Writes to `/var/backups` failing with `No space left on device` despite available disk blocks.
+*   **Root Cause:** inode exhaustion - too many 0 bite files hogging the inodes
+*   **Triage & Resolution Commands:**
+    *   `cd /var` & `df -i`
+    *   `sudo find /var/backups -type f -delete`
+    *   `echo "/tmp/backup-vol.img /var/backups ext4 loop,defaults 0 0" | sudo tee -a /etc/fstab`
+
+## 4. Service Crash-Loop (`systemd` Supervision)
+*   **Symptom:** `ecommerce-app.service` failing continuously with exit code status errors.
+*   **Root Cause Layer 1 (POSIX File Permissions):** +x flag wasn't in place - had to make it executable to run the script
+*   **Root Cause Layer 2 (Least Privilege Violation):** trying to create a file in /etc dir - need root elevation, which is forbidden.
+*   **Triage & Resolution Commands:**
+    *   `systemctl status ecommerce-app.service` & `sudo journalctl -u ecommerce-app.service`
+    *   `chmod +x /usr/local/bin/ecommerce-app.sh`
+    *   `sudo systemctl edit --full ecommerce-app.service`, append under [Service] RuntimeDirectory=ecommerce, change script to `touch /run/ecommerce/ecommerce.lock`
+    *   `systemctl status ecommerce-app.service` & logs
+    *   `● ecommerce-app.service - Critical E-Commerce Backend
+     Loaded: loaded (/etc/systemd/system/ecommerce-app.service; disabled; preset: enabled)
+     Active: active (running) since Mon 2026-10-12 02:21:12 EDT; 55s ago
+ Invocation: bd2bcc450f574f478bbee566f6663e13
+   Main PID: 7522 (ecommerce-app.s)
+      Tasks: 2 (limit: 2317)
+     Memory: 572K (peak: 2M)
+        CPU: 6ms
+     CGroup: /system.slice/ecommerce-app.service
+             ├─7522 /bin/bash /usr/local/bin/ecommerce-app.sh
+             └─7525 sleep 300`
