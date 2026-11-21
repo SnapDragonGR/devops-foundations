@@ -1,0 +1,7 @@
+[Unit]
+Description=Check the agent's settings and locks are intact
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/homelab-agent-sync check

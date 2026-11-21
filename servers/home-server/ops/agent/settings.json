@@ -1,0 +1,54 @@
+{
+  "agentMode": "",
+  "toolPermission": "request-review",
+  "enableTerminalSandbox": false,
+  "permissions": {
+    "allow": [
+      "command(sudo /usr/local/bin/homelab-agent help)",
+      "command(sudo /usr/local/bin/homelab-agent ps)",
+      "command(sudo /usr/local/bin/homelab-agent stats)",
+      "command(sudo /usr/local/bin/homelab-agent logs)",
+      "command(sudo /usr/local/bin/homelab-agent status)",
+      "command(sudo /usr/local/bin/homelab-agent health)",
+      "command(sudo /usr/local/bin/homelab-agent vpn-check)",
+      "command(sudo /usr/local/bin/homelab-agent disk)",
+      "command(sudo /usr/local/bin/homelab-agent smart)",
+      "command(sudo /usr/local/bin/homelab-agent timers)",
+      "command(sudo /usr/local/bin/homelab-agent drift)",
+      "command(sudo /usr/local/bin/homelab-agent checksum)",
+      "command(git status)",
+      "command(git diff)",
+      "command(git log)",
+      "command(git show)",
+      "command(git pull)",
+      "command(git switch)",
+      "command(git branch)",
+      "command(git add)",
+      "command(git commit)",
+      "command(git format-patch)",
+      "command(ls)",
+      "command(cat)",
+      "command(grep)",
+      "command(head)",
+      "command(tail)",
+      "command(wc)",
+      "write_file(/home/agent/work/)",
+      "write_file(/srv/agent-outbox/)"
+    ],
+    "ask": [
+      "command(sudo /usr/local/bin/homelab-agent restart)",
+      "read_url(*)",
+      "execute_url(*)",
+      "mcp(*)"
+    ],
+    "deny": [
+      "command(chattr)",
+      "command(rm -rf)",
+      "write_file(/home/agent/.gemini/)",
+      "write_file(/home/agent/.ssh/)"
+    ]
+  },
+  "trustedWorkspaces": [
+    "/home/agent/work/devops-foundations"
+  ]
+}

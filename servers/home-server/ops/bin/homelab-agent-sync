@@ -1,0 +1,86 @@
+#!/bin/bash
+# homelab-agent-sync — reset the agent's settings from /etc/homelab-agent, refresh its locked
+# briefing, and make sure every place where hooks, MCP servers, rules or plugins could be added
+# stays locked (install); or verify all of that (check).
+# Safe to trigger by the agent (via 'homelab-agent reset-config'): root never writes inside
+# folders the agent owns, never unlocks them, and never follows symlinks.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+SRC=/etc/homelab-agent
+A=/home/agent
+H="$A/.gemini"
+W="$A/work/devops-foundations"
+RULES="$H/AGENTS.md"
+SETTINGS="$H/antigravity-cli/settings.json"
+# agy drops settings that equal its defaults when it saves, so compare with those defaults filled in
+KEYS='{agentMode: (.agentMode // ""), toolPermission: (.toolPermission // "request-review"), enableTerminalSandbox: (.enableTerminalSandbox // false), trustedWorkspaces, permissions}'
+
+# Root-owned, immutable folders: nothing new can be created in them (hooks.json, skills, plugins, rules, GEMINI.md...)
+LOCK_DIRS=("$H" "$H/config" "$H/config/projects" "$H/antigravity-cli/rules" "$A/.agents" "$A/.agent" "$W/.agents" "$W/.agent")
+# Root-owned, immutable files
+LOCK_FILES=("$RULES" "$H/config/mcp_config.json" "$H/config/projects/default-cli-project.json")
+
+die()       { echo "ERROR: $*" >&2; exit 1; }
+is_locked() { lsattr -d "$1" 2>/dev/null | awk '{print $1}' | grep -q i; }
+[[ $EUID -eq 0 ]] || die "run with sudo"
+
+case "${1:-install}" in
+  install)
+    # 1. Settings: merged by root, but read and written AS THE AGENT, inside its own folder.
+    cur=$(runuser -u agent -- cat "$SETTINGS" 2>/dev/null || true)
+    [[ -n "$cur" ]] || cur='{}'
+    merged=$(jq -n --argjson cur "$cur" --slurpfile ours "$SRC/settings.json" '$cur * $ours[0]' 2>/dev/null) \
+      || merged=$(cat "$SRC/settings.json")
+    printf '%s\n' "$merged" | runuser -u agent -- sh -c 'umask 077; cat > "$1.new" && mv -f "$1.new" "$1"' sh "$SETTINGS"
+
+    # 2. Briefing: lives in root-owned ~/.gemini, so the agent cannot swap it for a symlink.
+    [[ "$(stat -c %U "$H")" == root && ! -L "$H" ]] || die "$H must be a real folder owned by root"
+    [[ ! -L "$RULES" ]] || die "$RULES is a symlink"
+    [[ -e "$RULES" ]] && chattr -i "$RULES"
+    cp "$SRC/AGENTS.md" "$RULES"
+    chown root:root "$RULES"; chmod 644 "$RULES"; chattr +i "$RULES"
+
+    # 3. Lock folders: create if missing (never through a symlink), then make immutable.
+    for d in "${LOCK_DIRS[@]}"; do
+      [[ ! -L "$d" ]] || die "$d is a symlink"
+      [[ -d "$d" ]] || install -d -o root -g root -m 755 "$d"
+      [[ "$(stat -c %U "$d")" == root ]] || die "$d is not owned by root"
+      chattr +i "$d"
+    done
+    # 4. Lock files that exist (they sit in root-owned folders).
+    for f in "${LOCK_FILES[@]}"; do
+      [[ -e "$f" ]] || continue
+      [[ ! -L "$f" ]] || die "$f is a symlink"
+      chattr +i "$f"
+    done
+    echo "settings reset, rules and folders locked"
+    ;;
+  check)
+    fail=0
+    cmp -s "$SRC/AGENTS.md" "$RULES" || { echo "AGENTS.md differs from $SRC"; fail=1; }
+    want=$(jq -S "$KEYS" "$SRC/settings.json")
+    have=$(runuser -u agent -- cat "$SETTINGS" 2>/dev/null | jq -S "$KEYS" 2>/dev/null || echo missing)
+    [[ "$want" == "$have" ]] || { echo "settings.json differs from $SRC"; fail=1; }
+    for p in "${LOCK_FILES[@]}" "${LOCK_DIRS[@]}"; do
+      [[ -e "$p" || -L "$p" ]] || continue
+      { [[ ! -L "$p" ]] && is_locked "$p"; } || { echo "not locked: $p"; fail=1; }
+    done
+    for f in "$W/AGENTS.md" "$W/GEMINI.md" "$A/AGENTS.md" "$A/GEMINI.md"; do
+      if [[ -e "$f" || -L "$f" ]]; then echo "unexpected rules file: $f"; fail=1; fi
+    done
+    if (( fail )); then
+      /usr/local/bin/homelab-notify --urgent "agent config changed or unlocked — run: sudo homelab-agent-sync check" || true
+      exit 1
+    fi
+    echo "agent config OK"
+    ;;
+  unlock)
+    # Maintenance by Gleb only. Stop agy first. Re-lock with 'install'.
+    for p in "${LOCK_FILES[@]}" "${LOCK_DIRS[@]}"; do
+      [[ -e "$p" && ! -L "$p" ]] && chattr -i "$p" || true
+    done
+    echo "unlocked — run 'sudo homelab-agent-sync install' when done"
+    ;;
+  *) echo "usage: homelab-agent-sync [install|check|unlock]" >&2; exit 2 ;;
+esac

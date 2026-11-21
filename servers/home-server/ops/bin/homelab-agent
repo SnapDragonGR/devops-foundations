@@ -1,0 +1,112 @@
+#!/bin/bash
+# homelab-agent — the only root door for the 'agent' user.
+# Fixed menu, every argument checked, every call logged, output scrubbed.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+DOCKER=/usr/bin/docker
+STATE=/var/lib/homelab-agent
+UPDATE_LOCK=/run/homelab-update.lock
+VERIFY_FLAG=/var/lib/homelab-update/pending-verify
+REPO=/home/gleb/devops-foundations
+RESTART_OK="sonarr radarr prowlarr bazarr flaresolverr cleanuparr seerr recyclarr audiobookshelf jellyfin"
+MAX_RESTARTS=3
+CALLER="${SUDO_USER:-$(id -un)}"
+
+log()  { logger -t homelab-agent -- "user=$CALLER $*"; }
+die()  { echo "REFUSED: $*" >&2; log "refused: $*"; exit 2; }
+
+# Blank out secrets, long hex strings and public IPv4 addresses.
+redact() {
+  perl -pe '
+    s/(bearer\s+)\S+/$1\[REDACTED]/gi;
+    s/((?:api[_-]?key|apikey|token|password|passwd|secret|authorization)["\x27]?\s*[:=]\s*["\x27]?)[^"\x27\s&,;<]+/$1\[REDACTED]/gi;
+    s{(<(?:api[_-]?key|password|token)>)[^<]+}{$1\[REDACTED]}gi;
+    s/\b[0-9a-f]{32,}\b/[HEX]/gi;
+    s{\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b}{
+      ($1==10 || $1==127 || $1==0 || ($1==172 && $2>=16 && $2<=31) || ($1==192 && $2==168) || ($1==100 && $2>=64 && $2<=127))
+        ? "$1.$2.$3.$4" : "[PUBLIC-IP]"
+    }ge;
+  '
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,40}$ ]] || die "bad name: $1"; }
+container_exists() { "$DOCKER" ps -a --format '{{.Names}}' | grep -Fx -- "$1" >/dev/null || die "no such container: $1"; }
+
+usage() {
+  cat <<'USAGE_EOF'
+homelab-agent — read-only views of MCPC, plus approved restarts.
+  ps                      containers: name, image, status
+  stats                   CPU and memory per container
+  logs <container> [N]    last N log lines (default 100, max 500), secrets blanked
+  status                  last backup, last update, snapshots, quarantine
+  health                  full health check
+  vpn-check               VPN / IPv6 leak / port-forward checks only
+  disk                    free space
+  smart                   media disk health counters
+  timers                  homelab timers
+  drift                   files changed but not committed in Gleb's repo (names only)
+  checksum <name>         sha256 of /usr/local/bin/homelab-<name>
+  restart <container>     restart one allowed app (asks Gleb, Telegram ping, max 3/hour)
+  reset-config            restore the agent settings from /etc/homelab-agent (run before each session)
+USAGE_EOF
+}
+
+cmd="${1:-help}"
+log "args=$*"
+
+case "$cmd" in
+  help|-h|--help) usage ;;
+  ps)     "$DOCKER" ps -a --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' ;;
+  stats)  "$DOCKER" stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' ;;
+  logs)
+    name="${2:-}"; lines="${3:-100}"
+    [[ -n "$name" ]] || die "usage: logs <container> [lines]"
+    valid_name "$name"; container_exists "$name"
+    [[ "$lines" =~ ^[0-9]{1,3}$ ]] && (( 10#$lines >= 1 && 10#$lines <= 500 )) || die "lines must be 1-500"
+    "$DOCKER" logs --tail "$lines" --timestamps "$name" 2>&1 | redact ;;
+  status) /usr/local/bin/homelab-status 2>&1 | redact ;;
+  health) /usr/local/bin/homelab-smoke-test 2>&1 | redact ;;
+  vpn-check)
+    /usr/local/bin/homelab-smoke-test --no-indexers 2>&1 | grep -E '^(OK|FAIL) +(vpn|ipv6-leak|port-forward)\b' || true ;;
+  disk)   df -h / /srv/media/data ;;
+  smart)
+    smartctl -A /dev/sda | awk 'NR<=7 || $1 ~ /^(ID#|5|187|188|193|197|198|199)$/' ;;
+  timers) systemctl list-timers --all --no-pager | grep -E 'NEXT|homelab|audiobook' || true ;;
+  drift)
+    echo "Last commit: $(runuser -u gleb -- git -C "$REPO" log -1 --format='%h %cr  %s')"
+    echo "Changed, not committed:"
+    runuser -u gleb -- git -C "$REPO" status --porcelain | grep -v -- '\.env' || echo "  (nothing)" ;;
+  checksum)
+    name="${2:-}"; [[ -n "$name" ]] || die "usage: checksum <name>"
+    valid_name "$name"
+    f="/usr/local/bin/homelab-$name"; [[ -f "$f" ]] || die "no such script: $f"
+    sha256sum "$f" ;;
+  restart)
+    name="${2:-}"; [[ -n "$name" ]] || die "usage: restart <container>"
+    valid_name "$name"
+    [[ " $RESTART_OK " == *" $name "* ]] || die "$name is not on the restart list"
+    container_exists "$name"
+    flock -n "$UPDATE_LOCK" true || die "the weekly update is running"
+    [[ ! -e "$VERIFY_FLAG" ]] || die "post-reboot check is pending"
+    mkdir -p "$STATE"; touch "$STATE/restarts"
+    now=$(date +%s)
+    recent=$(awk -v t=$((now - 3600)) '$1 > t' "$STATE/restarts" | wc -l)
+    (( recent < MAX_RESTARTS )) || die "limit reached: $recent restarts in the last hour"
+    echo "$now $name" >> "$STATE/restarts"
+    log "restarting $name"
+    "$DOCKER" restart "$name" >/dev/null
+    result="did not come back within 3 minutes"
+    for _ in $(seq 36); do
+      st=$("$DOCKER" inspect -f '{{.State.Status}}{{if .State.Health}} {{.State.Health.Status}}{{end}}' "$name")
+      if [[ "$st" == "running healthy" || "$st" == "running" ]]; then result="healthy"; break; fi
+      sleep 5
+    done
+    log "restart $name: $result"
+    /usr/local/bin/homelab-notify "agent restarted $name — $result" || true
+    echo "$name: $result"
+    [[ "$result" == "healthy" ]] ;;
+  reset-config) /usr/local/bin/homelab-agent-sync install ;;
+  *) die "unknown command: $cmd (try: help)" ;;
+esac
