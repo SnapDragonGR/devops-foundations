@@ -55,7 +55,7 @@ docker_started_at() {
 
 # running_services PROJECT : print the services of a project that are running right now.
 running_services() {
-    containers_json | jq -r --arg p "$1" '.[] | select(.project == $p and .status == "running") | .service'
+    containers_json | jq -r --arg p "$1" '.[] | select(.project == $p and .status == "running" and .service != "mc") | .service'
 }
 
 # ================================ dry run ======================================
@@ -256,7 +256,7 @@ if [ -z "$DRILL_APP" ]; then
     for project in "$MAIN_PROJECT" "$SIDE_PROJECT"; do
         file="$(compose_file "$project")"
         now="$(containers_json)"
-        mapfile -t services < <(printf '%s' "$now" | jq -r --arg p "$project" '.[] | select(.project == $p and .status == "running") | .service')
+        mapfile -t services < <(printf '%s' "$now" | jq -r --arg p "$project" '.[] | select(.project == $p and .status == "running" and .service != "mc") | .service')
         if [ "${#services[@]}" -eq 0 ]; then
             continue
         fi
