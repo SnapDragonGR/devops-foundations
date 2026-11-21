@@ -1,2 +1,8 @@
 .env
 servers/home-server/config
+
+# AI agent briefing files — never public
+AGENTS.md
+GEMINI.md
+.agents/
+.agent/
