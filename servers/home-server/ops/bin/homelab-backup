@@ -186,6 +186,7 @@ backup_config() {
         "$CONFIG_DIR/**/logs" \
         "$CONFIG_DIR/jellyfin/cache" \
         "$CONFIG_DIR/jellyfin/**/transcodes" \
+        "/home/agent/.gemini" \
         > "$STAGING/exclude-list.txt"
 
     while IFS= read -r -d '' src; do
@@ -252,7 +253,10 @@ backup_config() {
     add_path /etc/docker/daemon.json
     add_path /etc/firewalld
     add_path /etc/homelab
-    for p in /usr/local/bin/homelab-* /etc/systemd/system/homelab-* /etc/systemd/system/audiobook-import.*; do
+    add_path /etc/sudoers.d
+    add_path /etc/homelab-agent
+    add_path /etc/systemd/system/user-1001.slice.d
+    for p in /usr/local/bin/homelab-* /etc/systemd/system/homelab-* /etc/systemd/system/homelab-agent-check.* /etc/systemd/system/audiobook-import.*; do
         add_path "$p"
     done
     sort -u -o "$STAGING/backup-list.txt" "$STAGING/backup-list.txt"
