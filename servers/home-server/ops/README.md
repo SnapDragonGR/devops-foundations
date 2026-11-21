@@ -58,3 +58,24 @@ upgrades are switched off in `/etc/apt/apt.conf.d/99-homelab-no-auto-upgrade`.
 11. `/root/restore/srv/media/data/backups/staging/host-state/` lists the packages, mounts,
     timers and image versions the old server had.
 12. Run `sudo homelab-smoke-test`. Then delete `/root/restore`: it holds secrets.
+
+## Agent
+
+An unprivileged `agent` user runs an AI homelab assistant in `~/work/devops-foundations`.
+It has no access to secrets or live system changes and writes proposed edits as patches
+to `/srv/agent-outbox/`.
+
+- **Connect:** from the PC, run `ssh mcpc-agent`, then `work` to start the agent session.
+- **Review and apply proposals:** read `NOTES.md` and the `*.patch` file(s) in
+  `/srv/agent-outbox/<YYYYMMDD>-<topic>/`. To apply, run from `~/devops-foundations`:
+  `git am /srv/agent-outbox/<YYYYMMDD>-<topic>/*.patch`, then follow the deploy and test
+  steps in `NOTES.md`. Delete old outbox folders once you are done with them.
+- **Kill switch:** run `sudo pkill -u agent` to stop all agent processes right away. To
+  disable the agent completely, lock the account and move its sudoers rule away:
+  `sudo usermod -L agent` and `sudo mv /etc/sudoers.d/homelab-agent /root/`.
+- **Lost laptop:** remove the laptop in the Tailscale admin console, and delete its SSH key
+  lines from both `authorized_keys` files (`/home/gleb/.ssh/authorized_keys` and
+  `/home/agent/.ssh/authorized_keys`).
+- **Change agent settings:** edit the files in `/etc/homelab-agent/`, then run
+  `sudo homelab-agent-sync install`.
+
