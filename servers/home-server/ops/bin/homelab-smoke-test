@@ -44,7 +44,8 @@ INJECT="${HOMELAB_INJECT_FAIL:-}"
 FAILS=0
 WEB_OK=" "
 TSV="$(mktemp /tmp/homelab-smoke.XXXXXX)" || exit 2
-trap 'rm -f -- "$TSV"' EXIT
+QBIT_TMP=""
+trap 'rm -f -- "$TSV"; [ -n "$QBIT_TMP" ] && rm -f -- "$QBIT_TMP/cookie" "$QBIT_TMP/user" "$QBIT_TMP/pass" && rmdir -- "$QBIT_TMP" 2>/dev/null || true' EXIT
 mkdir -p -- "$(dirname -- "$JSON_OUT")"
 
 # record NAME BLAMES STATUS [DETAIL] : store one result and print it.
@@ -97,6 +98,16 @@ web_check() {
 # api_key APP : read the API key from the app's config file. It is never printed.
 api_key() {
     sed -n 's:.*<ApiKey>\(.*\)</ApiKey>.*:\1:p' "$CONFIG_DIR/$1/config.xml" 2> /dev/null | head -n 1
+}
+
+# compose_env_val KEY : read one value from /srv/media/compose/.env without sourcing it.
+compose_env_val() {
+    local val
+    val="$(grep -m 1 "^$1=" /srv/media/compose/.env 2> /dev/null | cut -d= -f2- || true)"
+    if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+    fi
+    printf '%s' "$val"
 }
 
 # api_post APP URL : send an empty POST with the app's API key, print the answer.
@@ -173,12 +184,12 @@ done < <(printf '%s' "$CONTAINERS" | jq -r '.[] | [.name, .service, .status, .he
 # ---- 2. Web pages -------------------------------------------------------------
 web_check sonarr sonarr "http://$HOST_IP:8989/ping"
 web_check radarr radarr "http://$HOST_IP:7878/ping"
-web_check prowlarr prowlarr "http://$HOST_IP:9696/ping"
+web_check prowlarr "prowlarr,gluetun" "http://$HOST_IP:9696/ping"
 web_check jellyfin jellyfin "http://$HOST_IP:8096/health"
 web_check seerr seerr "http://$HOST_IP:5055/api/v1/status"
 web_check audiobookshelf audiobookshelf "http://$HOST_IP:13378/healthcheck"
 web_check bazarr bazarr "http://$HOST_IP:6767/"
-web_check flaresolverr flaresolverr "http://$HOST_IP:8191/"
+web_check flaresolverr "flaresolverr,gluetun" "http://$HOST_IP:8191/"
 web_check cleanuparr cleanuparr "http://$HOST_IP:11011/health"
 web_check qbittorrent "qbittorrent,gluetun" "http://$HOST_IP:8080/"
 
@@ -202,8 +213,22 @@ if is_running qbittorrent && is_running gluetun; then
     fi
 
     gluetun_port="$(docker exec gluetun cat /tmp/gluetun/forwarded_port 2> /dev/null | tr -dc '0-9')"
-    qbit_port="$(docker exec qbittorrent curl -s -m 10 http://localhost:8080/api/v2/app/preferences 2> /dev/null |
+    QBIT_TMP="$(mktemp -d /tmp/homelab-smoke-qbit.XXXXXX)" || exit 2
+    chmod 700 "$QBIT_TMP"
+    (
+        umask 077
+        compose_env_val QBIT_USER > "$QBIT_TMP/user"
+        compose_env_val QBIT_PASS > "$QBIT_TMP/pass"
+    )
+    curl -s -m 10 -o /dev/null -c "$QBIT_TMP/cookie" -H "Referer: http://$HOST_IP:8080" \
+        --data-urlencode "username@$QBIT_TMP/user" --data-urlencode "password@$QBIT_TMP/pass" \
+        "http://$HOST_IP:8080/api/v2/auth/login" || true
+    qbit_port="$(curl -s -m 10 -b "$QBIT_TMP/cookie" -H "Referer: http://$HOST_IP:8080" \
+        "http://$HOST_IP:8080/api/v2/app/preferences" 2> /dev/null |
         jq -r '.listen_port // empty' 2> /dev/null || true)"
+    rm -f -- "$QBIT_TMP/cookie" "$QBIT_TMP/user" "$QBIT_TMP/pass"
+    rmdir -- "$QBIT_TMP" 2> /dev/null || true
+    QBIT_TMP=""
     if [ -n "$gluetun_port" ] && [ "$gluetun_port" = "$qbit_port" ]; then
         record port-forward "gluetun,qbittorrent" OK
     else

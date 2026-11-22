@@ -285,9 +285,9 @@ if [ -z "$DRILL_APP" ]; then
         if [ "${#to_update[@]}" -gt 0 ]; then
             log "Recreating with new images: ${to_update[*]}"
             docker compose -f "$file" up -d --no-deps "${to_update[@]}"
-            # qBittorrent and Prowlarr live inside Gluetun's network: a new Gluetun needs them recreated.
+            # qBittorrent, Prowlarr and FlareSolverr live inside Gluetun's network: a new Gluetun needs them recreated.
             if printf '%s\n' "${to_update[@]}" | grep -qx gluetun; then
-                for dep in qbittorrent prowlarr; do
+                for dep in qbittorrent prowlarr flaresolverr; do
                     if printf '%s\n' "${services[@]}" | grep -qx "$dep"; then
                         log "Gluetun was recreated: recreating $dep too"
                         docker compose -f "$file" up -d --no-deps --force-recreate "$dep"

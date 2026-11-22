@@ -12,9 +12,11 @@ services:
       media_net:
         aliases:
           - prowlarr
+          - flaresolverr
     ports:
       - "${SERVER_IP}:8080:8080"
       - "${SERVER_IP}:9696:9696"
+      - "${SERVER_IP}:8191:8191"
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=wireguard
@@ -23,11 +25,14 @@ services:
       - SERVER_COUNTRIES=${SERVER_COUNTRIES}
       - VPN_PORT_FORWARDING=on
       - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+      - BLOCK_MALICIOUS=off
+      - QBIT_USER=${QBIT_USER}
+      - QBIT_PASS=${QBIT_PASS}
       #  LAN traffic
       - FIREWALL_OUTBOUND_SUBNETS=192.168.0.0/16,172.16.0.0/12
       - TZ=${TZ}
       # Auto-update qBittorrent's listening port when Proton rotates it
-      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'sleep 30 && wget -O- --retry-connrefused --waitretry=15 --tries=15 --post-data "json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+      - 'VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c ''sleep 30 && umask 077 && C=/tmp/qbit.cookies P=/tmp/qbit.post && rm -f "$$C" "$$P" && enc() { printf "%s" "$$1" | od -An -tx1 -v | tr -d " \t\r\n" | sed "s/../%&/g"; } && printf "username=%s&password=%s" "$$(enc "$$QBIT_USER")" "$$(enc "$$QBIT_PASS")" > "$$P" && wget -qO /dev/null --retry-connrefused --waitretry=15 --tries=15 --header="Referer: http://127.0.0.1:8080" --header="Content-Type: application/x-www-form-urlencoded" --save-cookies="$$C" --keep-session-cookies --post-file="$$P" http://127.0.0.1:8080/api/v2/auth/login && (grep -qE "(^|[[:space:]])(QBT_)?SID" "$$C" || { echo "ERROR: qBittorrent login failed (no SID cookie)" >&2; exit 1; }) && wget -O- --retry-connrefused --waitretry=15 --tries=15 --header="Referer: http://127.0.0.1:8080" --load-cookies="$$C" --post-data="json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1; RC=$$?; rm -f "$$C" "$$P"; exit $$RC'''
     volumes:
       - /srv/media/config/gluetun:/gluetun
     restart: unless-stopped
@@ -150,18 +155,17 @@ services:
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
-    networks:
-      - media_net
-    ports:
-      - "8191:8191"
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
     environment:
       - LOG_LEVEL=info
       - LOG_HTML=false
       - CAPTCHA_SOLVER=none
       - TZ=${TZ}
     restart: unless-stopped
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=1
     deploy:
       resources:
         limits:

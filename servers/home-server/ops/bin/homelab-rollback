@@ -67,10 +67,10 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# The list of apps. Gluetun, qBittorrent and Prowlarr share a network namespace and go together.
+# The list of apps. Gluetun, qBittorrent, Prowlarr and FlareSolverr share a network namespace and go together.
 apps=("$@")
 if printf '%s\n' "${apps[@]}" | grep -qx gluetun; then
-    for dep in qbittorrent prowlarr; do
+    for dep in qbittorrent prowlarr flaresolverr; do
         if ! printf '%s\n' "${apps[@]}" | grep -qx "$dep" && was_running "$dep"; then
             apps+=("$dep")
         fi
@@ -157,13 +157,13 @@ for app in "${apps[@]}"; do
     fi
 done
 
-# ---- 4. Start (Gluetun first, then qBittorrent and Prowlarr fresh inside it) --------
+# ---- 4. Start (Gluetun first, then qBittorrent, Prowlarr and FlareSolverr fresh inside it)
 for app in "${apps[@]}"; do
-    if [ "$app" != "qbittorrent" ] && [ "$app" != "prowlarr" ]; then
+    if [ "$app" != "qbittorrent" ] && [ "$app" != "prowlarr" ] && [ "$app" != "flaresolverr" ]; then
         docker compose -f "$(compose_file "$(field "$app" project)")" up -d --no-deps --pull never "$app"
     fi
 done
-for dep in qbittorrent prowlarr; do
+for dep in qbittorrent prowlarr flaresolverr; do
     if printf '%s\n' "${apps[@]}" | grep -qx "$dep"; then
         docker compose -f "$MAIN_FILE" up -d --no-deps --pull never --force-recreate "$dep"
     fi
