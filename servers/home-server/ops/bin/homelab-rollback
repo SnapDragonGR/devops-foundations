@@ -67,12 +67,14 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# The list of apps. Gluetun and qBittorrent always go together.
+# The list of apps. Gluetun, qBittorrent and Prowlarr share a network namespace and go together.
 apps=("$@")
-if printf '%s\n' "${apps[@]}" | grep -qx gluetun && ! printf '%s\n' "${apps[@]}" | grep -qx qbittorrent; then
-    if was_running qbittorrent; then
-        apps+=(qbittorrent)
-    fi
+if printf '%s\n' "${apps[@]}" | grep -qx gluetun; then
+    for dep in qbittorrent prowlarr; do
+        if ! printf '%s\n' "${apps[@]}" | grep -qx "$dep" && was_running "$dep"; then
+            apps+=("$dep")
+        fi
+    done
 fi
 for app in "${apps[@]}"; do
     if ! was_running "$app"; then
@@ -155,15 +157,17 @@ for app in "${apps[@]}"; do
     fi
 done
 
-# ---- 4. Start (Gluetun first, qBittorrent fresh inside it) --------------------------
+# ---- 4. Start (Gluetun first, then qBittorrent and Prowlarr fresh inside it) --------
 for app in "${apps[@]}"; do
-    if [ "$app" != "qbittorrent" ]; then
+    if [ "$app" != "qbittorrent" ] && [ "$app" != "prowlarr" ]; then
         docker compose -f "$(compose_file "$(field "$app" project)")" up -d --no-deps --pull never "$app"
     fi
 done
-if printf '%s\n' "${apps[@]}" | grep -qx qbittorrent; then
-    docker compose -f "$MAIN_FILE" up -d --no-deps --pull never --force-recreate qbittorrent
-fi
+for dep in qbittorrent prowlarr; do
+    if printf '%s\n' "${apps[@]}" | grep -qx "$dep"; then
+        docker compose -f "$MAIN_FILE" up -d --no-deps --pull never --force-recreate "$dep"
+    fi
+done
 # fail2ban reads the log folders of swag and jellyfin: restart it so it sees the new folders.
 if printf '%s\n' "${apps[@]}" | grep -qxE 'swag|jellyfin' && was_running fail2ban && ! printf '%s\n' "${apps[@]}" | grep -qx fail2ban; then
     docker compose -f "$MAIN_FILE" restart fail2ban
