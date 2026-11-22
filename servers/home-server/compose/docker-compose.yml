@@ -25,7 +25,7 @@ services:
       - SERVER_COUNTRIES=${SERVER_COUNTRIES}
       - VPN_PORT_FORWARDING=on
       - VPN_PORT_FORWARDING_PROVIDER=protonvpn
-      - BLOCK_MALICIOUS=off
+      - DNS_UNBLOCK_HOSTNAMES=rutor.info
       - QBIT_USER=${QBIT_USER}
       - QBIT_PASS=${QBIT_PASS}
       #  LAN traffic
