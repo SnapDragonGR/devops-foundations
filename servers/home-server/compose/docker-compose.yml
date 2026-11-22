@@ -9,9 +9,12 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     networks:
-      - media_net
+      media_net:
+        aliases:
+          - prowlarr
     ports:
       - "${SERVER_IP}:8080:8080"
+      - "${SERVER_IP}:9696:9696"
     environment:
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=wireguard
@@ -61,10 +64,11 @@ services:
   prowlarr:
     image: lscr.io/linuxserver/prowlarr:latest
     container_name: prowlarr
-    networks:
-      - media_net
-    ports:
-      - "${SERVER_IP}:9696:9696"
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -72,8 +76,6 @@ services:
     volumes:
       - /srv/media/config/prowlarr:/config
     restart: unless-stopped
-    sysctls:
-      - net.ipv6.conf.all.disable_ipv6=1
     deploy:
       resources:
         limits:
